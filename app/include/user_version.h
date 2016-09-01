@@ -6,9 +6,9 @@
 #define NODE_VERSION_REVISION	4U
 #define NODE_VERSION_INTERNAL   1U
 
-#define NODE_VERSION	"NodeMCU 1.5.4.1"
+#define NODE_VERSION	"NodeMCU 1.5.4.1 by evmik"
 #ifndef BUILD_DATE
-#define BUILD_DATE	  "unspecified"
+#define BUILD_DATE	  "2016/08/31"
 #endif
 
 extern char SDK_VERSION[];
