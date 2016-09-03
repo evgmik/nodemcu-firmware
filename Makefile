@@ -65,7 +65,7 @@ else
 # We are under other system, may be Linux. Assume using gcc.
 	# Can we use -fdata-sections?
 	ifndef COMPORT
-		ESPPORT = /dev/ttyUSB0
+		ESPPORT = /dev/ttyUSB1
 	else
 		ESPPORT = $(COMPORT)
 	endif
@@ -235,7 +235,7 @@ flash:
 ifndef PDIR
 	$(MAKE) -C ./app flash
 else
-	$(ESPTOOL) --port $(ESPPORT) write_flash 0x00000 $(FIRMWAREDIR)0x00000.bin 0x10000 $(FIRMWAREDIR)0x10000.bin
+	$(ESPTOOL) --port $(ESPPORT) write_flash 0x00000 $(FIRMWAREDIR)0x00000.bin 0x10000 $(FIRMWAREDIR)0x10000.bin 0x3fc000 $(TOP_DIR)/cache/esp_init_data_default.bin -fm dio -fs 32m
 endif
 
 .subdirs:
