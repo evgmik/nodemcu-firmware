@@ -13,6 +13,7 @@
 
 #include "ldebug.h"
 #include "ldo.h"
+#include "lflash.h"
 #include "lfunc.h"
 #include "lgc.h"
 #include "llex.h"
@@ -34,7 +35,7 @@ typedef struct LG {
   lua_State l;
   global_State g;
 } LG;
-  
+
 
 
 static void stack_init (lua_State *L1, lua_State *L) {
@@ -72,9 +73,12 @@ static void f_luaopen (lua_State *L, void *ud) {
   sethvalue(L, gt(L), luaH_new(L, 0, 2));  /* table of globals */
   sethvalue(L, registry(L), luaH_new(L, 0, 2));  /* registry */
   luaS_resize(L, MINSTRTABSIZE);  /* initial size of string table */
+#ifndef LUA_CROSS_COMPILER
+  luaN_init(L);                   /* optionally map RO string table */
+#endif
   luaT_init(L);
   luaX_init(L);
-  luaS_fix(luaS_newliteral(L, MEMERRMSG));
+  stringfix(luaS_newliteral(L, MEMERRMSG));
   g->GCthreshold = 4*g->totalbytes;
 }
 
@@ -192,6 +196,13 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
 #else
   g->memlimit = 0;
 #endif
+#ifndef LUA_CROSS_COMPILER
+  g->ROstrt.size = 0;
+  g->ROstrt.nuse = 0;
+  g->ROstrt.hash = NULL;
+  g->ROpvmain    = NULL;
+  g->LFSsize     = 0;
+#endif
   for (i=0; i<NUM_TAGS; i++) g->mt[i] = NULL;
   if (luaD_rawrunprotected(L, f_luaopen, NULL) != 0) {
     /* memory allocation error: free partial state */
@@ -214,7 +225,7 @@ extern lua_State *luaL_newstate (void);
 static lua_State *lua_crtstate;
 
 lua_State *lua_open(void) {
-  lua_crtstate = luaL_newstate(); 
+  lua_crtstate = luaL_newstate();
   return lua_crtstate;
 }
 
@@ -222,12 +233,12 @@ lua_State *lua_getstate(void) {
   return lua_crtstate;
 }
 LUA_API void lua_close (lua_State *L) {
-#ifndef LUA_CROSS_COMPILER  
+#ifndef LUA_CROSS_COMPILER
   lua_sethook( L, NULL, 0, 0 );
   lua_crtstate = NULL;
   lua_pushnil( L );
 //  lua_rawseti( L, LUA_REGISTRYINDEX, LUA_INT_HANDLER_KEY );
-#endif  
+#endif
   L = G(L)->mainthread;  /* only the main thread can be closed */
   lua_lock(L);
   luaF_close(L, L->stack);  /* close all upvalues for this thread */

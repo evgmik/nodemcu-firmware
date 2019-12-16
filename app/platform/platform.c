@@ -2,9 +2,9 @@
 
 #include "platform.h"
 #include "common.h"
-#include "c_stdio.h"
-#include "c_string.h"
-#include "c_stdlib.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "llimits.h"
 #include "gpio.h"
 #include "user_interface.h"
@@ -13,6 +13,8 @@
 #include "driver/spi.h"
 #include "driver/uart.h"
 #include "driver/sigma_delta.h"
+
+#define INTERRUPT_TYPE_IS_LEVEL(x)   ((x) >= GPIO_PIN_INTR_LOLEVEL)
 
 #ifdef GPIO_INTERRUPT_ENABLE
 static task_handle_t gpio_task_handle;
@@ -31,6 +33,27 @@ struct gpio_hook {
 static struct gpio_hook platform_gpio_hook;
 #endif
 #endif
+
+static const int uart_bitrates[] = {
+    BIT_RATE_300,
+    BIT_RATE_600,
+    BIT_RATE_1200,
+    BIT_RATE_2400,
+    BIT_RATE_4800,
+    BIT_RATE_9600,
+    BIT_RATE_19200,
+    BIT_RATE_31250,
+    BIT_RATE_38400,
+    BIT_RATE_57600,
+    BIT_RATE_74880,
+    BIT_RATE_115200,
+    BIT_RATE_230400,
+    BIT_RATE_256000,
+    BIT_RATE_460800,
+    BIT_RATE_921600,
+    BIT_RATE_1843200,
+    BIT_RATE_3686400
+};
 
 int platform_init()
 {
@@ -82,6 +105,7 @@ static void NO_INTR_CODE set_gpio_no_interrupt(uint8 pin, uint8_t push_pull) {
                    GPIO_REG_READ(GPIO_PIN_ADDR(GPIO_ID_PIN(pnum))) |
                    GPIO_PIN_PAD_DRIVER_SET(GPIO_PAD_DRIVER_ENABLE));      //enable open drain;
   }
+
   ETS_GPIO_INTR_ENABLE();
 }
 
@@ -130,12 +154,15 @@ int platform_gpio_mode( unsigned pin, unsigned mode, unsigned pull )
 
     case PLATFORM_GPIO_INPUT:
       GPIO_DIS_OUTPUT(pin_num[pin]);
-      /* run on */
+      set_gpio_no_interrupt(pin, TRUE);
+      break;
     case PLATFORM_GPIO_OUTPUT:
       set_gpio_no_interrupt(pin, TRUE);
+      GPIO_REG_WRITE(GPIO_ENABLE_W1TS_ADDRESS, BIT(pin_num[pin]));
       break;
     case PLATFORM_GPIO_OPENDRAIN:
       set_gpio_no_interrupt(pin, FALSE);
+      GPIO_REG_WRITE(GPIO_ENABLE_W1TS_ADDRESS, BIT(pin_num[pin]));
       break;
 
 #ifdef GPIO_INTERRUPT_ENABLE
@@ -184,6 +211,7 @@ int platform_gpio_read( unsigned pin )
 static void ICACHE_RAM_ATTR platform_gpio_intr_dispatcher (void *dummy){
   uint32 j=0;
   uint32 gpio_status = GPIO_REG_READ(GPIO_STATUS_ADDRESS);
+  uint32 now = system_get_time();
   UNUSED(dummy);
 
 #ifdef GPIO_INTERRUPT_HOOK_ENABLE
@@ -204,13 +232,29 @@ static void ICACHE_RAM_ATTR platform_gpio_intr_dispatcher (void *dummy){
     if (gpio_status&1) {
       int i = pin_num_inv[j];
       if (pin_int_type[i]) {
-        //disable interrupt
-        gpio_pin_intr_state_set(GPIO_ID_PIN(j), GPIO_PIN_INTR_DISABLE);
+        uint16_t diff = pin_counter[i].seen ^ pin_counter[i].reported;
+
+        pin_counter[i].seen = 0x7fff & (pin_counter[i].seen + 1);
+
+        if (INTERRUPT_TYPE_IS_LEVEL(pin_int_type[i])) {
+          //disable interrupt
+          gpio_pin_intr_state_set(GPIO_ID_PIN(j), GPIO_PIN_INTR_DISABLE);
+        }
         //clear interrupt status
         GPIO_REG_WRITE(GPIO_STATUS_W1TC_ADDRESS, BIT(j));
-        uint32 level = 0x1 & GPIO_INPUT_GET(GPIO_ID_PIN(j));
-	task_post_high (gpio_task_handle, (i<<1) + level);
-	// We re-enable the interrupt when we execute the callback
+
+        if (diff == 0 || diff & 0x8000) {
+          uint32 level = 0x1 & GPIO_INPUT_GET(GPIO_ID_PIN(j));
+	  if (!task_post_high (gpio_task_handle, (now << 8) + (i<<1) + level)) {
+            // If we fail to post, then try on the next interrupt
+            pin_counter[i].seen |= 0x8000;
+          }
+          // We re-enable the interrupt when we execute the callback (if level)
+        }
+      } else {
+        // this is an unexpected interrupt so shut it off for now
+        gpio_pin_intr_state_set(GPIO_ID_PIN(j), GPIO_PIN_INTR_DISABLE);
+        GPIO_REG_WRITE(GPIO_STATUS_W1TC_ADDRESS, BIT(j));
       }
     }
   }
@@ -265,7 +309,7 @@ int platform_gpio_register_intr_hook(uint32_t bits, platform_hook_function hook)
   }
 
   // This must be the register new hook / delete old hook
-  
+
   if (delete_slot < 0) {
     if (bits & oh.all_bits) {
       return 0;   // Attempt to hook already hooked bits
@@ -276,7 +320,7 @@ int platform_gpio_register_intr_hook(uint32_t bits, platform_hook_function hook)
   }
 
   // These return NULL if the count = 0 so only error check if > 0)
-  nh.entry = c_malloc( nh.count * sizeof(*(nh.entry)) );
+  nh.entry = malloc( nh.count * sizeof(*(nh.entry)) );
   if (nh.count && !(nh.entry)) {
     return 0;  // Allocation failure
   }
@@ -301,13 +345,13 @@ int platform_gpio_register_intr_hook(uint32_t bits, platform_hook_function hook)
   platform_gpio_hook = nh;
   ETS_GPIO_INTR_ENABLE();
 
-  c_free(oh.entry);
+  free(oh.entry);
   return 1;
 }
 #endif // GPIO_INTERRUPT_HOOK_ENABLE
 
 /*
- * Initialise GPIO interrupt mode. Optionally in RAM because interrupts are dsabled
+ * Initialise GPIO interrupt mode. Optionally in RAM because interrupts are disabled
  */
 void NO_INTR_CODE platform_gpio_intr_init( unsigned pin, GPIO_INT_TYPE type )
 {
@@ -340,6 +384,7 @@ uint32_t platform_uart_setup( unsigned id, uint32_t baud, int databits, int pari
     case BIT_RATE_4800:
     case BIT_RATE_9600:
     case BIT_RATE_19200:
+    case BIT_RATE_31250:
     case BIT_RATE_38400:
     case BIT_RATE_57600:
     case BIT_RATE_74880:
@@ -408,6 +453,64 @@ uint32_t platform_uart_setup( unsigned id, uint32_t baud, int databits, int pari
   uart_setup(id);
 
   return baud;
+}
+
+void platform_uart_get_config(unsigned id, uint32_t *baudp, uint32_t *databitsp, uint32_t *parityp, uint32_t *stopbitsp) {
+  UartConfig config =  uart_get_config(id);
+  int i;
+
+  int offset = config.baut_rate;
+
+  for (i = 0; i < sizeof(uart_bitrates) / sizeof(uart_bitrates[0]); i++) {
+    int diff = config.baut_rate - uart_bitrates[i];
+
+    if (diff < 0) {
+      diff = -diff;
+    }
+
+    if (diff < offset) {
+       offset = diff;
+       *baudp = uart_bitrates[i];
+    }
+  }
+
+  switch( config.data_bits )
+  {
+    case FIVE_BITS:
+      *databitsp = 5;
+      break;
+    case SIX_BITS:
+      *databitsp = 6;
+      break;
+    case SEVEN_BITS:
+      *databitsp = 7;
+      break;
+    case EIGHT_BITS:
+    default:
+      *databitsp = 8;
+      break;
+  }
+
+  switch (config.stop_bits)
+  {
+    case ONE_HALF_STOP_BIT:
+      *stopbitsp = PLATFORM_UART_STOPBITS_1_5;
+      break;
+    case TWO_STOP_BIT:
+      *stopbitsp = PLATFORM_UART_STOPBITS_2;
+      break;
+    default:
+      *stopbitsp = PLATFORM_UART_STOPBITS_1;
+      break;
+  }
+
+  if (config.exist_parity == STICK_PARITY_DIS) {
+    *parityp = PLATFORM_UART_PARITY_NONE;
+  } else if (config.parity == EVEN_BITS) {
+    *parityp = PLATFORM_UART_PARITY_EVEN;
+  } else {
+    *parityp = PLATFORM_UART_PARITY_ODD;
+  }
 }
 
 // if set=1, then alternate serial output pins are used. (15=rx, 13=tx)
@@ -632,16 +735,19 @@ uint32_t platform_i2c_setup( unsigned id, uint8_t sda, uint8_t scl, uint32_t spe
   platform_gpio_mode(sda, PLATFORM_GPIO_INPUT, PLATFORM_GPIO_PULLUP);   // inside this func call platform_pwm_close
   platform_gpio_mode(scl, PLATFORM_GPIO_INPUT, PLATFORM_GPIO_PULLUP);    // disable gpio interrupt first
 
-  i2c_master_gpio_init(sda, scl);
-  return PLATFORM_I2C_SPEED_SLOW;
+  return i2c_master_setup(id, sda, scl, speed);
+}
+
+bool platform_i2c_configured( unsigned id ){
+  return i2c_master_configured(id);
 }
 
 void platform_i2c_send_start( unsigned id ){
-  i2c_master_start();
+  i2c_master_start(id);
 }
 
 void platform_i2c_send_stop( unsigned id ){
-  i2c_master_stop();
+  i2c_master_stop(id);
 }
 
 int platform_i2c_send_address( unsigned id, uint16_t address, int direction ){
@@ -651,29 +757,26 @@ int platform_i2c_send_address( unsigned id, uint16_t address, int direction ){
            PLATFORM_I2C_DIRECTION_RECEIVER == 1 ) ) {
     direction = ( direction == PLATFORM_I2C_DIRECTION_TRANSMITTER ) ? 0 : 1;
   }
-
-  i2c_master_writeByte( (uint8_t) ((address << 1) | direction ));
-  // Low-level returns nack (0=acked); we return ack (1=acked).
-  return ! i2c_master_getAck();
+  return i2c_master_writeByte(id,
+    (uint8_t) ((address << 1) + (direction == PLATFORM_I2C_DIRECTION_TRANSMITTER ? 0 : 1))
+  );
 }
 
-int platform_i2c_send_byte( unsigned id, uint8_t data ){
-  i2c_master_writeByte(data);
-  // Low-level returns nack (0=acked); we return ack (1=acked).
-  return ! i2c_master_getAck();
+int platform_i2c_send_byte(unsigned id, uint8_t data ){
+  return i2c_master_writeByte(id, data);
 }
 
 int platform_i2c_recv_byte( unsigned id, int ack ){
-  uint8_t r = i2c_master_readByte();
-  i2c_master_setAck( !ack );
-  return r;
+  return i2c_master_readByte(id, ack);
 }
 
 // *****************************************************************************
 // SPI platform interface
-uint32_t platform_spi_setup( uint8_t id, int mode, unsigned cpol, unsigned cpha, uint32_t clock_div)
+uint32_t platform_spi_setup( uint8_t id, int mode, unsigned cpol, unsigned cpha, uint32_t clock_div )
 {
   spi_master_init( id, cpol, cpha, clock_div );
+  // all platform functions assume LSB order for MOSI & MISO buffer
+  spi_mast_byte_order( id, SPI_ORDER_LSB );
   return 1;
 }
 
@@ -696,22 +799,39 @@ spi_data_type platform_spi_send_recv( uint8_t id, uint8_t bitlen, spi_data_type 
   return spi_mast_get_miso( id, 0, bitlen );
 }
 
-int platform_spi_set_mosi( uint8_t id, uint16_t offset, uint8_t bitlen, spi_data_type data )
+int platform_spi_blkwrite( uint8_t id, size_t len, const uint8_t *data )
 {
-  if (offset + bitlen > 512)
-    return PLATFORM_ERR;
+  while (len > 0) {
+    size_t chunk_len = len > 64 ? 64 : len;
 
-  spi_mast_set_mosi( id, offset, bitlen, data );
+    spi_mast_blkset( id, chunk_len * 8, data );
+    spi_mast_transaction( id, 0, 0, 0, 0, chunk_len * 8, 0, 0 );
+
+    data = &(data[chunk_len]);
+    len -= chunk_len;
+  }
 
   return PLATFORM_OK;
 }
 
-spi_data_type platform_spi_get_miso( uint8_t id, uint16_t offset, uint8_t bitlen )
+int platform_spi_blkread( uint8_t id, size_t len, uint8_t *data )
 {
-  if (offset + bitlen > 512)
-    return 0;
+  uint8_t mosi_idle[64];
 
-  return spi_mast_get_miso( id, offset, bitlen );
+  os_memset( (void *)mosi_idle, 0xff, len > 64 ? 64 : len );
+
+  while (len > 0 ) {
+    size_t chunk_len = len > 64 ? 64 : len;
+
+    spi_mast_blkset( id, chunk_len * 8, mosi_idle );
+    spi_mast_transaction( id, 0, 0, 0, 0, chunk_len * 8, 0, -1 );
+    spi_mast_blkget( id, chunk_len * 8, data );
+
+    data = &(data[chunk_len]);
+    len -= chunk_len;
+  }
+
+  return PLATFORM_OK;
 }
 
 int platform_spi_transaction( uint8_t id, uint8_t cmd_bitlen, spi_data_type cmd_data,
@@ -745,19 +865,19 @@ uint32_t platform_s_flash_write( const void *from, uint32_t toaddr, uint32_t siz
   uint32_t *apbuf = NULL;
   uint32_t fromaddr = (uint32_t)from;
   if( (fromaddr & blkmask ) || (fromaddr >= INTERNAL_FLASH_MAPPED_ADDRESS)) {
-    apbuf = (uint32_t *)c_malloc(size);
+    apbuf = (uint32_t *)malloc(size);
     if(!apbuf)
       return 0;
-    c_memcpy(apbuf, from, size);
+    memcpy(apbuf, from, size);
   }
   system_soft_wdt_feed ();
   r = flash_write(toaddr, apbuf?(uint32 *)apbuf:(uint32 *)from, size);
   if(apbuf)
-    c_free(apbuf);
+    free(apbuf);
   if(SPI_FLASH_RESULT_OK == r)
     return size;
   else{
-    NODE_ERR( "ERROR in flash_write: r=%d at %08X\n", ( int )r, ( unsigned )toaddr);
+    NODE_ERR( "ERROR in flash_write: r=%d at %p\n", r, toaddr);
     return 0;
   }
 }
@@ -783,10 +903,10 @@ uint32_t platform_s_flash_read( void *to, uint32_t fromaddr, uint32_t size )
     r = flash_read(fromaddr, to2, size2);
     if(SPI_FLASH_RESULT_OK == r)
     {
-      os_memmove(to,to2,size2);
+      memmove(to,to2,size2);  // This is overlapped so must be memmove and not memcpy
       char back[ INTERNAL_FLASH_READ_UNIT_SIZE ] __attribute__ ((aligned(INTERNAL_FLASH_READ_UNIT_SIZE)));
       r=flash_read(fromaddr+size2,(uint32*)back,INTERNAL_FLASH_READ_UNIT_SIZE);
-      os_memcpy((uint8_t*)to+size2,back,INTERNAL_FLASH_READ_UNIT_SIZE);
+      memcpy((uint8_t*)to+size2,back,INTERNAL_FLASH_READ_UNIT_SIZE);
     }
   }
   else
@@ -795,24 +915,167 @@ uint32_t platform_s_flash_read( void *to, uint32_t fromaddr, uint32_t size )
   if(SPI_FLASH_RESULT_OK == r)
     return size;
   else{
-    NODE_ERR( "ERROR in flash_read: r=%d at %08X\n", ( int )r, ( unsigned )fromaddr);
+    NODE_ERR( "ERROR in flash_read: r=%d at %p\n", r, fromaddr);
     return 0;
   }
 }
 
 int platform_flash_erase_sector( uint32_t sector_id )
 {
-  system_soft_wdt_feed ();
+  NODE_DBG( "flash_erase_sector(%u)\n", sector_id);
   return flash_erase( sector_id ) == SPI_FLASH_RESULT_OK ? PLATFORM_OK : PLATFORM_ERR;
 }
 
-uint32_t platform_flash_mapped2phys (uint32_t mapped_addr)
-{
+static uint32_t flash_map_meg_offset (void) {
   uint32_t cache_ctrl = READ_PERI_REG(CACHE_FLASH_CTRL_REG);
   if (!(cache_ctrl & CACHE_FLASH_ACTIVE))
     return -1;
-  bool b0 = (cache_ctrl & CACHE_FLASH_MAPPED0) ? 1 : 0;
-  bool b1 = (cache_ctrl & CACHE_FLASH_MAPPED1) ? 1 : 0;
-  uint32_t meg = (b1 << 1) | b0;
-  return mapped_addr - INTERNAL_FLASH_MAPPED_ADDRESS + meg * 0x100000;
+  uint32_t m0 = (cache_ctrl & CACHE_FLASH_MAPPED0) ? 0x100000 : 0;
+  uint32_t m1 = (cache_ctrl & CACHE_FLASH_MAPPED1) ? 0x200000 : 0;
+  return m0 + m1;
+}
+
+uint32_t platform_flash_mapped2phys (uint32_t mapped_addr) {
+  uint32_t meg = flash_map_meg_offset();
+  return (meg&1) ? -1 : mapped_addr - INTERNAL_FLASH_MAPPED_ADDRESS + meg ;
+}
+
+uint32_t platform_flash_phys2mapped (uint32_t phys_addr) {
+  uint32_t meg = flash_map_meg_offset();
+  return (meg&1) ? -1 : phys_addr + INTERNAL_FLASH_MAPPED_ADDRESS - meg;
+}
+
+uint32_t platform_flash_get_partition (uint32_t part_id, uint32_t *addr) {
+  partition_item_t pt = {0,0,0};
+  system_partition_get_item(SYSTEM_PARTITION_CUSTOMER_BEGIN + part_id, &pt);
+  if (addr) {
+    *addr = pt.addr;
+  }
+  return  pt.type == 0 ? 0 : pt.size;
+}
+/*
+ * The Reboot Config Records are stored in the 4K flash page at offset 0x10000 (in
+ * the linker section .irom0.ptable) and is used for configuration changes that
+ * persist across reboots. This page contains a sequence of records, each of which
+ * is word-aligned and comprises a header and body of length 0-64 words.  The 4-byte
+ * header comprises a length, a RCR id, and two zero fill bytes.  These are written
+ * using flash NAND writing rules, so any unused area (all 0xFF) can be overwritten
+ * by a new record without needing to erase the RCR page.  Ditto any existing
+ * record can be marked as deleted by over-writing the header with the id set to
+ * PLATFORM_RCR_DELETED (0x0).  Note that the last word is not used additions so a
+ * scan for PLATFORM_RCR_FREE will always terminate.
+ *
+ * The number of updates is extremely low, so it is unlikely (but possible) that
+ * the page might fill with the churn of new RCRs, so in this case the write function
+ * compacts the page by eliminating all deleted records.  This does require a flash
+ * sector erase.
+ *
+ * NOTE THAT THIS ALGO ISN'T 100% ROBUST, eg. a powerfail between the erase and the
+ * wite-back will leave the page unitialised; ditto a powerfail between the record
+ * appned and old deletion will leave two records.  However this is better than the
+ * general integrity of SPIFFS, for example and the vulnerable window is typically
+ * less than 1 mSec every configuration change.
+ */
+extern uint32_t _irom0_text_start[];
+#define RCR_WORD(i) (_irom0_text_start[i])
+#define WORDSIZE sizeof(uint32_t)
+#define FLASH_SECTOR_WORDS (INTERNAL_FLASH_SECTOR_SIZE/WORDSIZE)
+
+uint32_t platform_rcr_read (uint8_t rec_id, void **rec) {
+//DEBUG os_printf("platform_rcr_read(%d,%08x)\n",rec_id,rec);
+    platform_rcr_t *rcr = (platform_rcr_t *) &RCR_WORD(0);
+    uint32_t i = 0;
+   /*
+    * Chain down the RCR page looking for a record that matches the record
+    * ID. If found return the size of the record and optionally its address.
+    */
+   while (1) {
+        // copy RCR header into RAM to avoid unaligned exceptions
+        platform_rcr_t r = (platform_rcr_t) RCR_WORD(i);
+        if (r.id == rec_id) {
+            if (rec) *rec = &RCR_WORD(i+1);
+            return r.len * WORDSIZE;
+        } else if (r.id == PLATFORM_RCR_FREE) {
+            break;
+        }
+        i += 1 + r.len;
+    }
+    return ~0;
+}
+
+/*
+ * Chain down the RCR page and look for an existing record that matches the record
+ * ID and the first free record.  If there is enough room, then append the new
+ * record and mark any previous record as deleted.  If the page is full then GC,
+ * erase the page and rewrite with the GCed content.
+ */
+#define MAXREC 65
+uint32_t platform_rcr_write (uint8_t rec_id, const void *inrec, uint8_t n) {
+    uint32_t nwords = (n+WORDSIZE-1) / WORDSIZE;
+    uint32_t reclen = (nwords+1)*WORDSIZE;
+    uint32_t *prev=NULL, *new = NULL;
+
+    // make local stack copy of inrec including header and any trailing fill bytes
+    uint32_t rec[MAXREC];
+    if (nwords >= MAXREC)
+        return ~0;
+    rec[0] = 0; rec[nwords] = 0;
+    ((platform_rcr_t *) rec)->id = rec_id;
+    ((platform_rcr_t *) rec)->len = nwords;
+    memcpy(rec+1, inrec, n);  // let memcpy handle 0 and odd byte cases
+
+    // find previous copy if any and exit if the replacement is the same value
+    uint8_t np = platform_rcr_read (rec_id, (void **) &prev);
+    if (prev && !os_memcmp(prev-1, rec, reclen))
+        return n;
+
+    // find next free slot
+    platform_rcr_read (PLATFORM_RCR_FREE, (void **) &new);
+    uint32_t nfree = &RCR_WORD(FLASH_SECTOR_WORDS) - new;
+
+    // Is there enough room to fit the rec in the RCR page?
+    if (nwords < nfree) {  // Note inequality needed to leave at least one all set word
+        uint32_t addr = platform_flash_mapped2phys((uint32_t)&new[-1]);
+        platform_s_flash_write(rec, addr, reclen);
+
+        if (prev) { // If a previous exists, then overwrite the hdr as DELETED
+            platform_rcr_t rcr = {0};
+            addr = platform_flash_mapped2phys((uint32_t)&prev[-1]);
+            rcr.id = PLATFORM_RCR_DELETED; rcr.len = np/WORDSIZE;
+            platform_s_flash_write(&rcr, addr, WORDSIZE);
+        }
+
+    } else {
+        platform_rcr_t *rcr = (platform_rcr_t *) &RCR_WORD(0), newrcr = {0};
+        uint32_t flash_addr = platform_flash_mapped2phys((uint32_t)&RCR_WORD(0));
+        uint32_t *buf, i, l, pass;
+
+        for (pass = 1; pass <= 2; pass++)  {
+            for (i = 0, l = 0; i < FLASH_SECTOR_WORDS - nfree; ) {
+                platform_rcr_t r = rcr[i]; // again avoid unaligned exceptions
+                if (r.id == PLATFORM_RCR_FREE)
+                    break;
+                if (r.id != PLATFORM_RCR_DELETED && r.id != rec_id) {
+                    if (pass == 2) memcpy(buf + l, rcr + i, (r.len + 1)*WORDSIZE);
+                    l += r.len + 1;
+                }
+                i += r.len + 1;
+            }
+            if (pass == 2) memcpy(buf + l, rec, reclen);
+            l += nwords + 1;
+            if (pass == 1) buf = malloc(l * WORDSIZE);
+
+            if (l >= FLASH_SECTOR_WORDS || !buf)
+                return ~0;
+        }
+        platform_flash_erase_sector(flash_addr/INTERNAL_FLASH_SECTOR_SIZE);
+        platform_s_flash_write(buf, flash_addr, l*WORDSIZE);
+        free(buf);
+    }
+    return nwords*WORDSIZE;
+}
+
+void* platform_print_deprecation_note( const char *msg, const char *time_frame)
+{
+  printf( "Warning, deprecated API! %s. It will be removed %s. See documentation for details.\n", msg, time_frame );
 }

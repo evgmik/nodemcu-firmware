@@ -11,16 +11,10 @@
 #ifdef LUAC_CROSS_FILE
 #include "luac_cross.h"
 #endif
-#ifdef LUA_CROSS_COMPILER
-#include <stdarg.h>
-#include <stddef.h>
-#include <ctype.h>
-#else
-#include "c_stdarg.h"
-#include "c_stddef.h"
-#include "c_types.h"
-#include <ctype.h>
-#endif
+#include <stdint.h>
+#include "stdarg.h"
+#include "stddef.h"
+#include "ctype.h"
 
 #include "luaconf.h"
 
@@ -173,7 +167,6 @@ LUA_API void  (lua_pushnil) (lua_State *L);
 LUA_API void  (lua_pushnumber) (lua_State *L, lua_Number n);
 LUA_API void  (lua_pushinteger) (lua_State *L, lua_Integer n);
 LUA_API void  (lua_pushlstring) (lua_State *L, const char *s, size_t l);
-LUA_API void  (lua_pushrolstring) (lua_State *L, const char *s, size_t l);
 LUA_API void  (lua_pushstring) (lua_State *L, const char *s);
 LUA_API const char *(lua_pushvfstring) (lua_State *L, const char *fmt,
                                                       va_list argp);

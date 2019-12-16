@@ -2,7 +2,7 @@
 #include "os_type.h"
 #include "osapi.h"
 #include "driver/uart.h"
-#include "c_types.h"
+#include <stdint.h>
 
 LOCAL os_timer_t readline_timer;
 
@@ -20,7 +20,7 @@ bool uart_getc(char *c){
     ETS_INTR_LOCK();
     *c = (char)*(pRxBuff->pReadPos);
     if (pRxBuff->pReadPos == (pRxBuff->pRcvMsgBuff + RX_BUFF_SIZE)) {
-        pRxBuff->pReadPos = pRxBuff->pRcvMsgBuff ; 
+        pRxBuff->pReadPos = pRxBuff->pRcvMsgBuff ;
     } else {
         pRxBuff->pReadPos++;
     }
@@ -73,7 +73,7 @@ start:
                 else
                     continue;
             }
-            
+
             /* end of line */
             if (ch == '\r' || ch == '\n')
             {

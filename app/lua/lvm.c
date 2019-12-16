@@ -10,9 +10,9 @@
 #define LUAC_CROSS_FILE
 
 #include "lua.h"
-#include C_HEADER_STDIO
-#include C_HEADER_STRING
-#include C_HEADER_MATH
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
 
 #include "ldebug.h"
 #include "ldo.h"
@@ -41,7 +41,7 @@ LUA_NUMBER luai_ipow(LUA_NUMBER a, LUA_NUMBER b) {
     LUA_NUMBER c = 1;
     for (;;) {
       if (b & 1)
-	c *= a;
+	      c *= a;
       b = b >> 1;
       if (b == 0)
 	return c;
@@ -130,18 +130,29 @@ void luaV_gettable (lua_State *L, const TValue *t, TValue *key, StkId val) {
   TValue temp;
   for (loop = 0; loop < MAXTAGLOOP; loop++) {
     const TValue *tm;
-    if (ttistable(t) || ttisrotable(t)) {  /* `t' is a table? */
-      void *h = ttistable(t) ? hvalue(t) : rvalue(t);
-      const TValue *res = ttistable(t) ? luaH_get((Table*)h, key) : luaH_get_ro(h, key); /* do a primitive get */
+
+    if (ttistable(t)) {  /* `t' is a table? */
+      Table *h = hvalue(t);
+      const TValue *res = luaH_get(h, key); /* do a primitive get */
       if (!ttisnil(res) ||  /* result is no nil? */
-          (tm = fasttm(L, ttistable(t) ? ((Table*)h)->metatable : (Table*)luaR_getmeta(h), TM_INDEX)) == NULL) { /* or no TM? */
+          (tm = fasttm(L, h->metatable, TM_INDEX)) == NULL) { /* or no TM? */
         setobj2s(L, val, res);
         return;
-      }      
+      }
+      /* else will try the tag method */
+    } else if (ttisrotable(t)) {  /* `t' is a table? */
+      void *h = rvalue(t);
+      const TValue *res = luaH_get_ro(h, key); /* do a primitive get */
+      if (!ttisnil(res) ||  /* result is no nil? */
+          (tm = fasttm(L, (Table*)luaR_getmeta(h), TM_INDEX)) == NULL) { /* or no TM? */
+        setobj2s(L, val, res);
+        return;
+      }
       /* else will try the tag method */
     }
     else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_INDEX)))
         luaG_typeerror(L, t, "index");
+
     if (ttisfunction(tm) || ttislightfunction(tm)) {
       callTMres(L, val, tm, t, key);
       return;
@@ -161,25 +172,27 @@ void luaV_settable (lua_State *L, const TValue *t, TValue *key, StkId val) {
   L->top++;
   fixedstack(L);
   for (loop = 0; loop < MAXTAGLOOP; loop++) {
-    const TValue *tm;
-    if (ttistable(t) || ttisrotable(t)) {  /* `t' is a table? */
-      void *h = ttistable(t) ? hvalue(t) : rvalue(t);
-      TValue *oldval = ttistable(t) ? luaH_set(L, (Table*)h, key) : NULL; /* do a primitive set */
-      if ((oldval && !ttisnil(oldval)) ||  /* result is no nil? */
-          (tm = fasttm(L, ttistable(t) ? ((Table*)h)->metatable : (Table*)luaR_getmeta(h), TM_NEWINDEX)) == NULL) { /* or no TM? */
-        if(oldval) {
-          L->top--;
-          unfixedstack(L);
-          setobj2t(L, oldval, val);
-          ((Table *)h)->flags = 0;
-          luaC_barriert(L, (Table*)h, val);
-        }
+    const TValue *tm = NULL;
+    if (ttistable(t)) {  /* `t' is a table? */
+      Table *h = hvalue(t);
+      TValue *oldval = luaH_set(L, h, key); /* do a primitive set */
+      if ((!ttisnil(oldval)) ||  /* result is no nil? */
+          (tm = fasttm(L, h->metatable, TM_NEWINDEX)) == NULL) {
+        L->top--;
+        unfixedstack(L);
+        setobj2t(L, oldval, val);
+        ((Table *)h)->flags = 0;
+        luaC_barriert(L, (Table*)h, val);
         return;
       }
       /* else will try the tag method */
     }
+    else if (ttisrotable(t)) {
+      luaG_runerror(L, "invalid write to ROM variable");
+    }
     else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_NEWINDEX)))
       luaG_typeerror(L, t, "index");
+
     if (ttisfunction(tm) || ttislightfunction(tm)) {
       L->top--;
       unfixedstack(L);
@@ -239,10 +252,10 @@ static int l_strcmp (const TString *ls, const TString *rs) {
   const char *r = getstr(rs);
   size_t lr = rs->tsv.len;
   for (;;) {
-    int temp = c_strcoll(l, r);
+    int temp = strcoll(l, r);
     if (temp != 0) return temp;
     else {  /* strings are equal up to a `\0' */
-      size_t len = c_strlen(l);  /* index of first `\0' in both strings */
+      size_t len = strlen(l);  /* index of first `\0' in both strings */
       if (len == lr)  /* r is finished? */
         return (len == ll) ? 0 : 1;
       else if (len == ll)  /* l is finished? */
@@ -292,8 +305,9 @@ int luaV_equalval (lua_State *L, const TValue *t1, const TValue *t2) {
     case LUA_TNIL: return 1;
     case LUA_TNUMBER: return luai_numeq(nvalue(t1), nvalue(t2));
     case LUA_TBOOLEAN: return bvalue(t1) == bvalue(t2);  /* true must be 1 !! */
-    case LUA_TLIGHTUSERDATA: 
     case LUA_TROTABLE:
+      return rvalue(t1) == rvalue(t2);
+    case LUA_TLIGHTUSERDATA:
     case LUA_TLIGHTFUNCTION:
       return pvalue(t1) == pvalue(t2);
     case LUA_TUSERDATA: {
@@ -320,7 +334,7 @@ void luaV_concat (lua_State *L, int total, int last) {
   if (G(L)->memlimit < max_sizet) max_sizet = G(L)->memlimit;
   do {
     /* Any call which does a memory allocation may trim the stack,
-       invalidating top unless the stack is fixed duri  ng the allocation */ 
+       invalidating top unless the stack is fixed during the allocation */
     StkId top = L->base + last + 1;
     fixedstack(L);
     int n = 2;  /* number of elements handled in this pass (at least 2) */
@@ -349,7 +363,7 @@ void luaV_concat (lua_State *L, int total, int last) {
       tl = 0;
       for (i=n; i>0; i--) {  /* concat all strings */
         size_t l = tsvalue(top-i)->len;
-        c_memcpy(buffer+tl, svalue(top-i), l);
+        memcpy(buffer+tl, svalue(top-i), l);
         tl += l;
       }
       setsvalue2s(L, top-n, luaS_newlstr(L, buffer, tl));
@@ -569,7 +583,7 @@ void luaV_execute (lua_State *L, int nexeccalls) {
       case OP_LEN: {
         const TValue *rb = RB(i);
         switch (ttype(rb)) {
-          case LUA_TTABLE: 
+          case LUA_TTABLE:
           case LUA_TROTABLE: {
             setnvalue(ra, ttistable(rb) ? cast_num(luaH_getn(hvalue(rb))) : cast_num(luaH_getn_ro(rvalue(rb))));
             break;
@@ -759,7 +773,6 @@ void luaV_execute (lua_State *L, int nexeccalls) {
         fixedstack(L);
         if (n == 0) {
           n = cast_int(L->top - ra) - 1;
-          L->top = L->ci->top;
         }
         if (c == 0) c = cast_int(*pc++);
         runtime_check(L, ttistable(ra));
@@ -772,6 +785,7 @@ void luaV_execute (lua_State *L, int nexeccalls) {
           setobj2t(L, luaH_setnum(L, h, last--), val);
           luaC_barriert(L, h, val);
         }
+	L->top = L->ci->top;
         unfixedstack(L);
         continue;
       }

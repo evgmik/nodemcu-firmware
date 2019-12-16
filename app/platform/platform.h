@@ -3,10 +3,11 @@
 #ifndef __PLATFORM_H__
 #define __PLATFORM_H__
 
+#include <stdint.h>
 #include "cpu_esp8266.h"
 
-#include "c_types.h"
 #include "driver/pwm.h"
+#include "driver/uart.h"
 #include "task/task.h"
 
 // Error / status codes
@@ -110,8 +111,8 @@ int platform_spi_send( uint8_t id, uint8_t bitlen, spi_data_type data );
 spi_data_type platform_spi_send_recv( uint8_t id, uint8_t bitlen, spi_data_type data );
 void platform_spi_select( unsigned id, int is_select );
 
-int platform_spi_set_mosi( uint8_t id, uint16_t offset, uint8_t bitlen, spi_data_type data );
-spi_data_type platform_spi_get_miso( uint8_t id, uint16_t offset, uint8_t bitlen );
+int platform_spi_blkwrite( uint8_t id, size_t len, const uint8_t *data );
+int platform_spi_blkread( uint8_t id, size_t len, uint8_t *data );
 int platform_spi_transaction( uint8_t id, uint8_t cmd_bitlen, spi_data_type cmd_data,
                               uint8_t addr_bitlen, spi_data_type addr_data,
                               uint16_t mosi_bitlen, uint8_t dummy_bitlen, int16_t miso_bitlen );
@@ -159,6 +160,7 @@ int platform_s_uart_recv( unsigned id, timer_data_type timeout );
 int platform_uart_set_flow_control( unsigned id, int type );
 int platform_s_uart_set_flow_control( unsigned id, int type );
 void platform_uart_alt( int set );
+void platform_uart_get_config(unsigned id, uint32_t *baudp, uint32_t *databitsp, uint32_t *parityp, uint32_t *stopbitsp);
 
 // *****************************************************************************
 // PWM subsection
@@ -233,7 +235,8 @@ void platform_sigma_delta_set_target( uint8_t target );
 enum
 {
   PLATFORM_I2C_SPEED_SLOW = 100000,
-  PLATFORM_I2C_SPEED_FAST = 400000
+  PLATFORM_I2C_SPEED_FAST = 400000,
+  PLATFORM_I2C_SPEED_FASTPLUS = 1000000
 };
 
 // I2C direction
@@ -249,6 +252,7 @@ static inline int platform_i2c_exists( unsigned id ) { return id < NUM_I2C; }
 static inline int platform_i2c_exists( unsigned id ) { return 0; }
 #endif
 uint32_t platform_i2c_setup( unsigned id, uint8_t sda, uint8_t scl, uint32_t speed );
+bool platform_i2c_configured( unsigned id );
 void platform_i2c_send_start( unsigned id );
 void platform_i2c_send_stop( unsigned id );
 int platform_i2c_send_address( unsigned id, uint16_t address, int direction );
@@ -277,20 +281,15 @@ int platform_flash_erase_sector( uint32_t sector_id );
 
 /**
  * Translated a mapped address to a physical flash address, based on the
- * current flash cache mapping.
+ * current flash cache mapping, and v.v.
  * @param mapped_addr Address to translate (>= INTERNAL_FLASH_MAPPED_ADDRESS)
  * @return the corresponding physical flash address, or -1 if flash cache is
  *  not currently active.
  * @see Cache_Read_Enable.
  */
 uint32_t platform_flash_mapped2phys (uint32_t mapped_addr);
-
-// *****************************************************************************
-// Allocator support
-
-void* platform_get_first_free_ram( unsigned id );
-void* platform_get_last_free_ram( unsigned id );
-
+uint32_t platform_flash_phys2mapped (uint32_t phys_addr);
+uint32_t platform_flash_get_partition (uint32_t part_id, uint32_t *addr);
 
 // *****************************************************************************
 // Other glue
@@ -300,6 +299,9 @@ int platform_gpio_exists( unsigned id );
 int platform_tmr_exists( unsigned id );
 
 // *****************************************************************************
+
+void* platform_print_deprecation_note( const char *msg, const char *time_frame);
+
 // Helper macros
 #define MOD_CHECK_ID( mod, id )\
   if( !platform_ ## mod ## _exists( id ) )\
@@ -314,5 +316,41 @@ int platform_tmr_exists( unsigned id );
 #define MOD_CHECK_RES_ID( mod, id, resmod, resid )\
   if( !platform_ ## mod ## _check_ ## resmod ## _id( id, resid ) )\
     return luaL_error( L, #resmod" %d not valid with " #mod " %d", ( unsigned )resid, ( unsigned )id )
+
+// *****************************************************************************
+// Reboot config page
+/*
+ * The 4K flash page in the linker section .irom0.ptable (offset 0x10000) is used 
+ * for configuration changes that persist across reboots. This 4k page contains a
+ * sequence of records that are written using flash NAND writing rules.  See the
+ * header app/spiffs/spiffs_nucleus.h for a discussion of how SPIFFS uses these. A
+ * similar technique is used here.
+ *
+ * Each record is word aligned and the first two bytes of the record are its size 
+ * and record type. Type 0xFF means unused and type 0x00 means deleted.  New 
+ * records can be added by overwriting the first unused slot.  Records can be 
+ * replaced by adding the new version, then setting the type of the previous version
+ * to deleted.  This all works and can be implemented with platform_s_flash_write()
+ * upto the 4K limit.
+ *
+ * If a new record cannot fit into the page then the deleted records are GCed by 
+ * copying the active records into a RAM scratch pad, erasing the page and writing 
+ * them back.  Yes, this is powerfail unsafe for a few mSec, but this is no worse 
+ * than writing to SPIFFS and won't even occur in normal production use.   
+ */
+#define IROM_PTABLE_ATTR          __attribute__((section(".irom0.ptable")))
+#define PLATFORM_PARTITION(n)  (SYSTEM_PARTITION_CUSTOMER_BEGIN + n)
+#define PLATFORM_RCR_DELETED   0x0
+#define PLATFORM_RCR_PT        0x1
+#define PLATFORM_RCR_PHY_DATA  0x2   
+#define PLATFORM_RCR_REFLASH   0x3
+#define PLATFORM_RCR_FREE      0xFF
+typedef union {
+    uint32_t hdr;
+    struct { uint8_t len,id; };
+} platform_rcr_t;
+
+uint32_t platform_rcr_read (uint8_t rec_id, void **rec);
+uint32_t platform_rcr_write (uint8_t rec_id, const void *rec, uint8_t size);
 
 #endif

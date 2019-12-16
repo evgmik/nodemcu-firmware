@@ -4,11 +4,10 @@
 #include "lauxlib.h"
 #include "platform.h"
 
-#include "c_types.h"
-#include "c_string.h"
+#include <stdint.h>
+#include <string.h>
 #include "rom.h"
 
-static lua_State *gL = NULL;
 static int uart_receive_rf = LUA_NOREF;
 bool run_input = true;
 bool uart_on_data_cb(const char *buf, size_t len){
@@ -16,18 +15,19 @@ bool uart_on_data_cb(const char *buf, size_t len){
     return false;
   if(uart_receive_rf == LUA_NOREF)
     return false;
-  if(!gL)
+  lua_State *L = lua_getstate();
+  if(!L)
     return false;
-  lua_rawgeti(gL, LUA_REGISTRYINDEX, uart_receive_rf);
-  lua_pushlstring(gL, buf, len);
-  lua_call(gL, 1, 0);
+  lua_rawgeti(L, LUA_REGISTRYINDEX, uart_receive_rf);
+  lua_pushlstring(L, buf, len);
+  lua_call(L, 1, 0);
   return !run_input;
 }
 
 uint16_t need_len = 0;
 int16_t end_char = -1;
 // Lua: uart.on("method", [number/char], function, [run_input])
-static int uart_on( lua_State* L )
+static int l_uart_on( lua_State* L )
 {
   size_t sl, el;
   int32_t run = 1;
@@ -67,7 +67,7 @@ static int uart_on( lua_State* L )
   } else {
     lua_pushnil(L);
   }
-  if(sl == 4 && c_strcmp(method, "data") == 0){
+  if(sl == 4 && strcmp(method, "data") == 0){
     run_input = true;
     if(uart_receive_rf != LUA_NOREF){
       luaL_unref(L, LUA_REGISTRYINDEX, uart_receive_rf);
@@ -75,7 +75,6 @@ static int uart_on( lua_State* L )
     }
     if(!lua_isnil(L, -1)){
       uart_receive_rf = luaL_ref(L, LUA_REGISTRYINDEX);
-      gL = L;
       if(run==0)
         run_input = false;
     } else {
@@ -85,18 +84,19 @@ static int uart_on( lua_State* L )
     lua_pop(L, 1);
     return luaL_error( L, "method not supported" );
   }
-  return 0; 
+  return 0;
 }
 
 bool uart0_echo = true;
 // Lua: actualbaud = setup( id, baud, databits, parity, stopbits, echo )
-static int uart_setup( lua_State* L )
+static int l_uart_setup( lua_State* L )
 {
-  unsigned id, databits, parity, stopbits, echo = 1;
-  u32 baud, res;
-  
+  uint32_t id, databits, parity, stopbits, echo = 1;
+  uint32_t baud, res;
+
   id = luaL_checkinteger( L, 1 );
   MOD_CHECK_ID( uart, id );
+
   baud = luaL_checkinteger( L, 2 );
   databits = luaL_checkinteger( L, 3 );
   parity = luaL_checkinteger( L, 4 );
@@ -114,11 +114,29 @@ static int uart_setup( lua_State* L )
   return 1;
 }
 
+// uart.getconfig(id)
+static int l_uart_getconfig( lua_State* L )
+{
+  uint32_t id, databits, parity, stopbits;
+  uint32_t baud;
+
+  id = luaL_checkinteger( L, 1 );
+  MOD_CHECK_ID( uart, id );
+
+  platform_uart_get_config(id, &baud, &databits, &parity, &stopbits);
+
+  lua_pushinteger(L, baud);
+  lua_pushinteger(L, databits);
+  lua_pushinteger(L, parity);
+  lua_pushinteger(L, stopbits);
+  return 4;
+}
+
 // Lua: alt( set )
-static int uart_alt( lua_State* L )
+static int l_uart_alt( lua_State* L )
 {
   unsigned set;
-  
+
   set = luaL_checkinteger( L, 1 );
 
   platform_uart_alt( set );
@@ -126,13 +144,13 @@ static int uart_alt( lua_State* L )
 }
 
 // Lua: write( id, string1, [string2], ..., [stringn] )
-static int uart_write( lua_State* L )
+static int l_uart_write( lua_State* L )
 {
   int id;
   const char* buf;
   size_t len, i;
   int total = lua_gettop( L ), s;
-  
+
   id = luaL_checkinteger( L, 1 );
   MOD_CHECK_ID( uart, id );
   for( s = 2; s <= total; s ++ )
@@ -156,18 +174,19 @@ static int uart_write( lua_State* L )
 }
 
 // Module function map
-static const LUA_REG_TYPE uart_map[] =  {
-  { LSTRKEY( "setup" ), LFUNCVAL( uart_setup ) },
-  { LSTRKEY( "write" ), LFUNCVAL( uart_write ) },
-  { LSTRKEY( "on" ),    LFUNCVAL( uart_on ) },
-  { LSTRKEY( "alt" ),   LFUNCVAL( uart_alt ) },
-  { LSTRKEY( "STOPBITS_1" ),   LNUMVAL( PLATFORM_UART_STOPBITS_1 ) },
-  { LSTRKEY( "STOPBITS_1_5" ), LNUMVAL( PLATFORM_UART_STOPBITS_1_5 ) },
-  { LSTRKEY( "STOPBITS_2" ),   LNUMVAL( PLATFORM_UART_STOPBITS_2 ) },
-  { LSTRKEY( "PARITY_NONE" ),  LNUMVAL( PLATFORM_UART_PARITY_NONE ) },
-  { LSTRKEY( "PARITY_EVEN" ),  LNUMVAL( PLATFORM_UART_PARITY_EVEN ) },
-  { LSTRKEY( "PARITY_ODD" ),   LNUMVAL( PLATFORM_UART_PARITY_ODD ) },
-  { LNILKEY, LNILVAL }
-};
+LROT_BEGIN(uart)
+  LROT_FUNCENTRY( setup, l_uart_setup )
+  LROT_FUNCENTRY( getconfig, l_uart_getconfig )
+  LROT_FUNCENTRY( write, l_uart_write )
+  LROT_FUNCENTRY( on, l_uart_on )
+  LROT_FUNCENTRY( alt, l_uart_alt )
+  LROT_NUMENTRY( STOPBITS_1, PLATFORM_UART_STOPBITS_1 )
+  LROT_NUMENTRY( STOPBITS_1_5, PLATFORM_UART_STOPBITS_1_5 )
+  LROT_NUMENTRY( STOPBITS_2, PLATFORM_UART_STOPBITS_2 )
+  LROT_NUMENTRY( PARITY_NONE, PLATFORM_UART_PARITY_NONE )
+  LROT_NUMENTRY( PARITY_EVEN, PLATFORM_UART_PARITY_EVEN )
+  LROT_NUMENTRY( PARITY_ODD, PLATFORM_UART_PARITY_ODD )
+LROT_END( uart, NULL, 0 )
 
-NODEMCU_MODULE(UART, "uart", uart_map, NULL);
+
+NODEMCU_MODULE(UART, "uart", uart, NULL);

@@ -309,7 +309,7 @@ static int b_unpack (lua_State *L) {
     size_t size = optsize(L, opt, &fmt);
     pos += gettoalign(pos, &h, opt, size);
     luaL_argcheck(L, pos+size <= ld, 2, "data string too short");
-    luaL_checkstack(L, 1, "too many results");
+    luaL_checkstack(L, 2, "too many results");
     switch (opt) {
       case 'b': case 'B': case 'h': case 'H':
       case 'l': case 'L': case 'T': case 'i':  case 'I': {  /* integer types */
@@ -389,13 +389,12 @@ static int b_size (lua_State *L) {
 /* }====================================================== */
 
 
+LROT_BEGIN(thislib)
+  LROT_FUNCENTRY( pack, b_pack )
+  LROT_FUNCENTRY( unpack, b_unpack )
+  LROT_FUNCENTRY( size, b_size )
+LROT_END( thislib, NULL, 0 )
 
-static const LUA_REG_TYPE thislib[] = {
-  {LSTRKEY("pack"), LFUNCVAL(b_pack)},
-  {LSTRKEY("unpack"), LFUNCVAL(b_unpack)},
-  {LSTRKEY("size"), LFUNCVAL(b_size)},
-  {LNILKEY, LNILVAL}
-};
 
 
 NODEMCU_MODULE(STRUCT, "struct", thislib, NULL);

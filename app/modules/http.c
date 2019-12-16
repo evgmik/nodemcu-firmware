@@ -3,24 +3,27 @@
  * vowstar@gmail.com
  * 2015-12-29
 *******************************************************************************/
+#include <stdlib.h>
 #include "module.h"
 #include "lauxlib.h"
 #include "platform.h"
 #include "cpu_esp8266.h"
-#include "httpclient.h"
+#include "http/httpclient.h"
 
 static int http_callback_registry  = LUA_NOREF;
 
-static void http_callback( char * response, int http_status, char * full_response )
+static void http_callback( char * response, int http_status, char ** full_response_p )
 {
+  const char *full_response = full_response_p ? *full_response_p : NULL;
+
 #if defined(HTTPCLIENT_DEBUG_ON)
-  c_printf( "http_status=%d\n", http_status );
+  dbg_printf( "http_status=%d\n", http_status );
   if ( http_status != HTTP_STATUS_GENERIC_ERROR )
   {
     if (full_response != NULL) {
-      c_printf( "strlen(full_response)=%d\n", strlen( full_response ) );
+      dbg_printf( "strlen(full_response)=%d\n", strlen( full_response ) );
     }
-    c_printf( "response=%s<EOF>\n", response );
+    dbg_printf( "response=%s<EOF>\n", response );
   }
 #endif
   if (http_callback_registry != LUA_NOREF)
@@ -33,15 +36,70 @@ static void http_callback( char * response, int http_status, char * full_respons
     if ( http_status != HTTP_STATUS_GENERIC_ERROR && response)
     {
       lua_pushstring(L, response);
+      lua_newtable(L);
+
+      const char *p = full_response;
+
+      // Need to skip the HTTP/1.1 header line
+      while (*p && *p != '\n') {
+        p++;
+      }
+      if (*p == '\n') {
+        p++;
+      }
+
+      while (*p && *p != '\r' && *p != '\n') {
+        const char *eol = p;
+        while (*eol && *eol != '\r') {
+          eol++;
+        }
+
+        const char *colon = p;
+        while (*colon != ':' && colon < eol) {
+          colon++;
+        }
+
+        if (*colon != ':') {
+          break;
+        }
+
+        const char *value = colon + 1;
+        while (*value == ' ') {
+          value++;
+        }
+
+        luaL_Buffer b;
+        luaL_buffinit(L, &b);
+        while (p < colon) {
+          luaL_addchar(&b, tolower((unsigned char) *p));
+          p++;
+        }
+        luaL_pushresult(&b);
+
+        lua_pushlstring(L, value, eol - value);
+        lua_settable(L, -3);
+
+        p = eol + 1;
+        if (*p == '\n') {
+          p++;
+        }
+      }
     }
     else
     {
       lua_pushnil(L);
+      lua_pushnil(L);
     }
-    lua_call(L, 2, 0); // With 2 arguments and 0 result
+
+    if (full_response_p && *full_response_p) {
+      free(*full_response_p);
+      *full_response_p = NULL;
+    }
 
     luaL_unref(L, LUA_REGISTRYINDEX, http_callback_registry);
     http_callback_registry = LUA_NOREF;
+
+    lua_call(L, 3, 0); // With 3 arguments and 0 result
   }
 }
 
@@ -71,12 +129,11 @@ static int http_lapi_request( lua_State *L )
 
   if (lua_type(L, 5) == LUA_TFUNCTION || lua_type(L, 5) == LUA_TLIGHTFUNCTION) {
     lua_pushvalue(L, 5);  // copy argument (func) to the top of stack
-    if (http_callback_registry != LUA_NOREF)
-      luaL_unref(L, LUA_REGISTRYINDEX, http_callback_registry);
+    luaL_unref(L, LUA_REGISTRYINDEX, http_callback_registry);
     http_callback_registry = luaL_ref(L, LUA_REGISTRYINDEX);
   }
 
-  http_request(url, method, headers, body, http_callback);
+  http_request(url, method, headers, body, http_callback, 0);
   return 0;
 }
 
@@ -212,17 +269,17 @@ static int http_lapi_get( lua_State *L )
 }
 
 // Module function map
-static const LUA_REG_TYPE http_map[] = {
-  { LSTRKEY( "request" ),         LFUNCVAL( http_lapi_request ) },
-  { LSTRKEY( "post" ),            LFUNCVAL( http_lapi_post ) },
-  { LSTRKEY( "put" ),             LFUNCVAL( http_lapi_put ) },
-  { LSTRKEY( "delete" ),          LFUNCVAL( http_lapi_delete ) },
-  { LSTRKEY( "get" ),             LFUNCVAL( http_lapi_get ) },
+LROT_BEGIN(http)
+  LROT_FUNCENTRY( request, http_lapi_request )
+  LROT_FUNCENTRY( post, http_lapi_post )
+  LROT_FUNCENTRY( put, http_lapi_put )
+  LROT_FUNCENTRY( delete, http_lapi_delete )
+  LROT_FUNCENTRY( get, http_lapi_get )
 
-  { LSTRKEY( "OK" ),              LNUMVAL( 0 ) },
-  { LSTRKEY( "ERROR" ),           LNUMVAL( HTTP_STATUS_GENERIC_ERROR ) },
-  
-  { LNILKEY, LNILVAL }
-};
+  LROT_NUMENTRY( OK, 0 )
+  LROT_NUMENTRY( ERROR, HTTP_STATUS_GENERIC_ERROR )
 
-NODEMCU_MODULE(HTTP, "http", http_map, NULL);
+LROT_END( http, NULL, 0 )
+
+
+NODEMCU_MODULE(HTTP, "http", http, NULL);

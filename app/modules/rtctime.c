@@ -35,18 +35,31 @@ static int __isleap (int year) {
 }
 
 // ******* C API functions *************
+void __attribute__((noreturn)) TEXT_SECTION_ATTR rtc_time_enter_deep_sleep_final (void)
+{
+  ets_intr_lock();
+  Cache_Read_Disable();
+  rtc_reg_write(0x18,8);
+  rtc_reg_write_and_loop(0x08,0x00100000); //  go to sleep
+  __builtin_unreachable();
+}
 
 void rtctime_early_startup (void)
 {
-  Cache_Read_Enable (0, 0, 1);
+//  Cache_Read_Enable (0, 0, 1);
   rtc_time_register_bootup ();
   rtc_time_switch_clocks ();
-  Cache_Read_Disable ();
+//  Cache_Read_Disable ();
 }
 
 void rtctime_late_startup (void)
 {
   rtc_time_switch_system ();
+}
+
+void rtctime_adjust_rate (int rate)
+{
+  rtc_time_set_rate (rate);
 }
 
 void rtctime_gettimeofday (struct rtc_timeval *tv)
@@ -58,7 +71,9 @@ void rtctime_settimeofday (const struct rtc_timeval *tv)
 {
   if (!rtc_time_check_magic ())
     rtc_time_prepare ();
+  int32_t rate = rtc_time_get_rate();
   rtc_time_settimeofday (tv);
+  rtc_time_set_rate(rate);
 }
 
 bool rtctime_have_time (void)
@@ -123,6 +138,9 @@ static int rtctime_set (lua_State *L)
 
   struct rtc_timeval tv = { sec, usec };
   rtctime_settimeofday (&tv);
+
+  if (lua_isnumber(L, 3))
+    rtc_time_set_rate(lua_tonumber(L, 3));
   return 0;
 }
 
@@ -134,7 +152,8 @@ static int rtctime_get (lua_State *L)
   rtctime_gettimeofday (&tv);
   lua_pushnumber (L, tv.tv_sec);
   lua_pushnumber (L, tv.tv_usec);
-  return 2;
+  lua_pushnumber (L, rtc_time_get_rate());
+  return 3;
 }
 
 static void do_sleep_opt (lua_State *L, int idx)
@@ -147,6 +166,15 @@ static void do_sleep_opt (lua_State *L, int idx)
     system_deep_sleep_set_option (opt);
   }
 }
+
+// rtctime.adjust_delta (usec)
+static int rtctime_adjust_delta (lua_State *L)
+{
+  uint32_t us = luaL_checknumber (L, 1);
+  lua_pushnumber(L, rtc_time_adjust_delta_by_rate(us));
+  return 1;
+}
+
 
 // rtctime.dsleep (usec, option)
 static int rtctime_dsleep (lua_State *L)
@@ -172,12 +200,9 @@ static int rtctime_dsleep_aligned (lua_State *L)
 }
 
 
-static void add_table_item (lua_State *L, const char *key, int val)
-{
-  lua_pushstring (L, key);
-  lua_pushinteger (L, val);
-  lua_rawset (L, -3);
-}
+#define ADD_TABLE_ITEM(L, key, val) \
+  lua_pushinteger (L, val);	    \
+  lua_setfield (L, -2, key);
 
 // rtctime.epoch2cal (stamp)
 static int rtctime_epoch2cal (lua_State *L)
@@ -190,26 +215,27 @@ static int rtctime_epoch2cal (lua_State *L)
 
   /* construct Lua table */
   lua_createtable (L, 0, 8);
-  add_table_item (L, "yday", date.tm_yday + 1);
-  add_table_item (L, "wday", date.tm_wday + 1);
-  add_table_item (L, "year", date.tm_year + 1900);
-  add_table_item (L, "mon",  date.tm_mon + 1);
-  add_table_item (L, "day",  date.tm_mday);
-  add_table_item (L, "hour", date.tm_hour);
-  add_table_item (L, "min",  date.tm_min);
-  add_table_item (L, "sec",  date.tm_sec);
+  ADD_TABLE_ITEM (L, "yday", date.tm_yday + 1);
+  ADD_TABLE_ITEM (L, "wday", date.tm_wday + 1);
+  ADD_TABLE_ITEM (L, "year", date.tm_year + 1900);
+  ADD_TABLE_ITEM (L, "mon",  date.tm_mon + 1);
+  ADD_TABLE_ITEM (L, "day",  date.tm_mday);
+  ADD_TABLE_ITEM (L, "hour", date.tm_hour);
+  ADD_TABLE_ITEM (L, "min",  date.tm_min);
+  ADD_TABLE_ITEM (L, "sec",  date.tm_sec);
 
   return 1;
 }
 
 // Module function map
-static const LUA_REG_TYPE rtctime_map[] = {
-  { LSTRKEY("set"),            LFUNCVAL(rtctime_set) },
-  { LSTRKEY("get"),            LFUNCVAL(rtctime_get) },
-  { LSTRKEY("dsleep"),         LFUNCVAL(rtctime_dsleep)  },
-  { LSTRKEY("dsleep_aligned"), LFUNCVAL(rtctime_dsleep_aligned) },
-  { LSTRKEY("epoch2cal"),      LFUNCVAL(rtctime_epoch2cal) },
-  { LNILKEY, LNILVAL }
-};
+LROT_BEGIN(rtctime)
+  LROT_FUNCENTRY( set, rtctime_set )
+  LROT_FUNCENTRY( get, rtctime_get )
+  LROT_FUNCENTRY( adjust_delta, rtctime_adjust_delta )
+  LROT_FUNCENTRY( dsleep, rtctime_dsleep )
+  LROT_FUNCENTRY( dsleep_aligned, rtctime_dsleep_aligned )
+  LROT_FUNCENTRY( epoch2cal, rtctime_epoch2cal )
+LROT_END( rtctime, NULL, 0 )
 
-NODEMCU_MODULE(RTCTIME, "rtctime", rtctime_map, NULL);
+
+NODEMCU_MODULE(RTCTIME, "rtctime", rtctime, NULL);

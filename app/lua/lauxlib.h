@@ -8,15 +8,9 @@
 #ifndef lauxlib_h
 #define lauxlib_h
 
-
 #include "lua.h"
 
-#ifdef LUA_CROSS_COMPILER
 #include <stdio.h>
-#else
-#include "c_stdio.h"
-#endif
-
 
 #if defined(LUA_COMPAT_GETN)
 LUALIB_API int (luaL_getn) (lua_State *L, int t);
@@ -47,7 +41,7 @@ LUALIB_API void (luaI_openlib) (lua_State *L, const char *libname,
 LUALIB_API void (luaL_register) (lua_State *L, const char *libname,
                                 const luaL_Reg *l);
 LUALIB_API void (luaL_register_light) (lua_State *L, const char *libname,
-                                const luaL_Reg *l);                                
+                                const luaL_Reg *l);
 LUALIB_API int (luaL_getmetafield) (lua_State *L, int obj, const char *e);
 LUALIB_API int (luaL_callmeta) (lua_State *L, int obj, const char *e);
 LUALIB_API int (luaL_typerror) (lua_State *L, int narg, const char *tname);

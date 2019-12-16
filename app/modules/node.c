@@ -1,5 +1,4 @@
 // Module for interfacing with system
-
 #include "module.h"
 #include "lauxlib.h"
 
@@ -16,14 +15,13 @@
 #include "lundump.h"
 
 #include "platform.h"
-#include "lrodefs.h"
-
-#include "c_types.h"
-#include "c_string.h"
+#include "lflash.h"
+#include <stdint.h>
+#include <string.h>
 #include "driver/uart.h"
 #include "user_interface.h"
 #include "flash_api.h"
-#include "flash_fs.h"
+#include "vfs.h"
 #include "user_version.h"
 #include "rom.h"
 #include "task/task.h"
@@ -38,10 +36,15 @@ static int node_restart( lua_State* L )
   return 0;
 }
 
+static int dsleepMax( lua_State *L ) {
+  lua_pushnumber(L, (uint64_t)system_rtc_clock_cali_proc()*(0x80000000-1)/(0x1000));
+  return 1;
+}
+
 // Lua: dsleep( us, option )
 static int node_deepsleep( lua_State* L )
 {
-  uint32 us;
+  uint64 us;
   uint8 option;
   //us = luaL_checkinteger( L, 1 );
   // Set deleep option, skip if nil
@@ -53,6 +56,9 @@ static int node_deepsleep( lua_State* L )
     else
       system_deep_sleep_set_option( option );
   }
+  bool instant = false;
+  if (lua_isnumber(L, 3))
+    instant = lua_tointeger(L, 3);
   // Set deleep time, skip if nil
   if ( lua_isnumber(L, 1) )
   {
@@ -61,40 +67,124 @@ static int node_deepsleep( lua_State* L )
     if ( us < 0 )
       return luaL_error( L, "wrong arg range" );
     else
-      system_deep_sleep( us );
+    {
+      if (instant)
+        system_deep_sleep_instant(us);
+      else
+        system_deep_sleep( us );
+    }
   }
   return 0;
 }
 
-// Lua: dsleep_set_options
-// Combined to dsleep( us, option )
-// static int node_deepsleep_setoption( lua_State* L )
-// {
-//   s32 option;
-//   option = luaL_checkinteger( L, 1 );
-//   if ( option < 0 || option > 4)
-//     return luaL_error( L, "wrong arg range" );
-//   else
-//    deep_sleep_set_option( option );
-//   return 0;
-// }
-// Lua: info()
 
+#ifdef PMSLEEP_ENABLE
+#include "pm/pmSleep.h"
+
+int node_sleep_resume_cb_ref= LUA_NOREF;
+void node_sleep_resume_cb(void)
+{
+  PMSLEEP_DBG("START");
+  pmSleep_execute_lua_cb(&node_sleep_resume_cb_ref);
+  PMSLEEP_DBG("END");
+}
+
+// Lua: node.sleep(table)
+static int node_sleep( lua_State* L )
+{
+#ifdef TIMER_SUSPEND_ENABLE
+  pmSleep_INIT_CFG(cfg);
+  cfg.sleep_mode=LIGHT_SLEEP_T;
+
+  if(lua_istable(L, 1)){
+    pmSleep_parse_table_lua(L, 1, &cfg, NULL, &node_sleep_resume_cb_ref);
+  }
+  else{
+    return luaL_argerror(L, 1, "must be table");
+  }
+
+  cfg.resume_cb_ptr = &node_sleep_resume_cb;
+  pmSleep_suspend(&cfg);
+#else
+  dbg_printf("\n The option \"TIMER_SUSPEND_ENABLE\" in \"app/include/user_config.h\" was disabled during FW build!\n");
+  return luaL_error(L, "node.sleep() is unavailable");
+#endif
+  return 0;
+}
+#else
+static int node_sleep( lua_State* L )
+{
+  dbg_printf("\n The options \"TIMER_SUSPEND_ENABLE\" and \"PMSLEEP_ENABLE\" in \"app/include/user_config.h\" were disabled during FW build!\n");
+  return luaL_error(L, "node.sleep() is unavailable");
+}
+#endif //PMSLEEP_ENABLE
 static int node_info( lua_State* L )
 {
-  lua_pushinteger(L, NODE_VERSION_MAJOR);
-  lua_pushinteger(L, NODE_VERSION_MINOR);
-  lua_pushinteger(L, NODE_VERSION_REVISION);
-  lua_pushinteger(L, system_get_chip_id());   // chip id
-  lua_pushinteger(L, spi_flash_get_id());     // flash id
-#if defined(FLASH_SAFE_API)
-  lua_pushinteger(L, flash_safe_get_size_byte() / 1024);  // flash size in KB
-#else
-  lua_pushinteger(L, flash_rom_get_size_byte() / 1024);  // flash size in KB
-#endif // defined(FLASH_SAFE_API)
-  lua_pushinteger(L, flash_rom_get_mode());
-  lua_pushinteger(L, flash_rom_get_speed());
-  return 8;
+  const char* options[] = {"hw", "sw_version", "build_config", "legacy", NULL};
+  int option = luaL_checkoption (L, 1, options[3], options);
+
+  switch (option) {
+    case 0: { // hw
+      lua_createtable (L, 0, 5);
+      int table_index = lua_gettop(L);
+      lua_pushinteger(L, system_get_chip_id());   // chip id
+      lua_setfield(L, table_index, "chip_id");
+      lua_pushinteger(L, spi_flash_get_id());     // flash id
+      lua_setfield(L, table_index, "flash_id");
+      lua_pushinteger(L, flash_rom_get_size_byte() / 1024);  // flash size in KB
+      lua_setfield(L, table_index, "flash_size");
+      lua_pushinteger(L, flash_rom_get_mode());
+      lua_setfield(L, table_index, "flash_mode");
+      lua_pushinteger(L, flash_rom_get_speed());
+      lua_setfield(L, table_index, "flash_speed");
+      return 1;
+    }
+    case 1: { // sw_version
+      lua_createtable (L, 0, 7);
+      int table_index = lua_gettop(L);
+      lua_pushinteger(L, NODE_VERSION_MAJOR);
+      lua_setfield(L, table_index, "node_version_major");
+      lua_pushinteger(L, NODE_VERSION_MINOR);
+      lua_setfield(L, table_index, "node_version_minor");
+      lua_pushinteger(L, NODE_VERSION_REVISION);
+      lua_setfield(L, table_index, "node_version_revision");
+      lua_pushstring(L, BUILDINFO_BRANCH);
+      lua_setfield(L, table_index, "git_branch");
+      lua_pushstring(L, BUILDINFO_COMMIT_ID);
+      lua_setfield(L, table_index, "git_commit_id");
+      lua_pushstring(L, BUILDINFO_RELEASE);
+      lua_setfield(L, table_index, "git_release");
+      lua_pushstring(L, BUILDINFO_RELEASE_DTS);
+      lua_setfield(L, table_index, "git_commit_dts");
+      return 1;
+    }
+    case 2: { // build_config
+      lua_createtable (L, 0, 4);
+      int table_index = lua_gettop(L);
+      lua_pushboolean(L, BUILDINFO_SSL);
+      lua_setfield(L, table_index, "ssl");
+      lua_pushnumber(L, BUILDINFO_LFS);
+      lua_setfield(L, table_index, "lfs_size");
+      lua_pushstring(L, BUILDINFO_MODULES);
+      lua_setfield(L, table_index, "modules");
+      lua_pushstring(L, BUILDINFO_BUILD_TYPE);
+      lua_setfield(L, table_index, "number_type");
+      return 1;
+    }
+    default:
+    {
+      platform_print_deprecation_note("node.info() without parameter", "in the next version");
+      lua_pushinteger(L, NODE_VERSION_MAJOR);
+      lua_pushinteger(L, NODE_VERSION_MINOR);
+      lua_pushinteger(L, NODE_VERSION_REVISION);
+      lua_pushinteger(L, system_get_chip_id());   // chip id
+      lua_pushinteger(L, spi_flash_get_id());     // flash id
+      lua_pushinteger(L, flash_rom_get_size_byte() / 1024);  // flash size in KB
+      lua_pushinteger(L, flash_rom_get_mode());
+      lua_pushinteger(L, flash_rom_get_speed());
+      return 8;
+    }
+  }
 }
 
 // Lua: chipid()
@@ -113,7 +203,6 @@ static int node_chipid( lua_State* L )
 //   lua_pushinteger(L, vdd33);
 //   return 1;
 // }
-
 // Lua: flashid()
 static int node_flashid( lua_State* L )
 {
@@ -125,15 +214,7 @@ static int node_flashid( lua_State* L )
 // Lua: flashsize()
 static int node_flashsize( lua_State* L )
 {
-  if (lua_type(L, 1) == LUA_TNUMBER)
-  {
-    flash_rom_set_size_byte(luaL_checkinteger(L, 1));
-  }
-#if defined(FLASH_SAFE_API)
-  uint32_t sz = flash_safe_get_size_byte();
-#else
   uint32_t sz = flash_rom_get_size_byte();
-#endif // defined(FLASH_SAFE_API)
   lua_pushinteger( L, sz );
   return 1;
 }
@@ -146,180 +227,16 @@ static int node_heap( lua_State* L )
   return 1;
 }
 
-#ifdef DEVKIT_VERSION_0_9
-static int led_high_count = LED_HIGH_COUNT_DEFAULT;
-static int led_low_count = LED_LOW_COUNT_DEFAULT;
-static int led_count = 0;
-static int key_press_count = 0;
-static bool key_short_pressed = false;
-static bool key_long_pressed = false;
-static os_timer_t keyled_timer;
-static int long_key_ref = LUA_NOREF;
-static int short_key_ref = LUA_NOREF;
-
-static void default_long_press(void *arg) {
-  if (led_high_count == 12 && led_low_count == 12) {
-    led_low_count = led_high_count = 6;
-  } else {
-    led_low_count = led_high_count = 12;
-  }
-  // led_high_count = 1000 / READLINE_INTERVAL;
-  // led_low_count = 1000 / READLINE_INTERVAL;
-  // NODE_DBG("default_long_press is called. hc: %d, lc: %d\n", led_high_count, led_low_count);
-}
-
-static void default_short_press(void *arg) {
-  system_restart();
-}
-
-static void key_long_press(void *arg) {
-  lua_State *L = lua_getstate();
-  NODE_DBG("key_long_press is called.\n");
-  if (long_key_ref == LUA_NOREF) {
-    default_long_press(arg);
-    return;
-  }
-  lua_rawgeti(L, LUA_REGISTRYINDEX, long_key_ref);
-  lua_call(L, 0, 0);
-}
-
-static void key_short_press(void *arg) {
-  lua_State *L = lua_getstate();
-  NODE_DBG("key_short_press is called.\n");
-  if (short_key_ref == LUA_NOREF) {
-    default_short_press(arg);
-    return;
-  }
-  lua_rawgeti(L, LUA_REGISTRYINDEX, short_key_ref);
-  lua_call(L, 0, 0);
-}
-
-static void update_key_led (void *p)
-{
-  (void)p;
-  uint8_t temp = 1, level = 1;
-  led_count++;
-  if(led_count>led_low_count+led_high_count){
-    led_count = 0;    // reset led_count, the level still high
-  } else if(led_count>led_low_count && led_count <=led_high_count+led_low_count){
-    level = 1;    // output high level
-  } else if(led_count<=led_low_count){
-    level = 0;    // output low level
-  }
-  temp = platform_key_led(level);
-  if(temp == 0){      // key is pressed
-    key_press_count++;
-    if(key_press_count>=KEY_LONG_COUNT){
-      // key_long_press(NULL);
-      key_long_pressed = true;
-      key_short_pressed = false;
-      // key_press_count = 0;
-    } else if(key_press_count>=KEY_SHORT_COUNT){    // < KEY_LONG_COUNT
-      // key_short_press(NULL);
-      key_short_pressed = true;
-    }
-  }else{  // key is released
-    key_press_count = 0;
-    if(key_long_pressed){
-      key_long_press(NULL);
-      key_long_pressed = false;
-    }
-    if(key_short_pressed){
-      key_short_press(NULL);
-      key_short_pressed = false;
-    }
-  }
-}
-
-static void prime_keyled_timer (void)
-{
-  os_timer_disarm (&keyled_timer);
-  os_timer_setfn (&keyled_timer, update_key_led, 0);
-  os_timer_arm (&keyled_timer, KEYLED_INTERVAL, 1);
-}
-
-// Lua: led(low, high)
-static int node_led( lua_State* L )
-{
-  int low, high;
-  if ( lua_isnumber(L, 1) )
-  {
-    low = lua_tointeger(L, 1);
-    if ( low < 0 ) {
-      return luaL_error( L, "wrong arg type" );
-    }
-  } else {
-    low = LED_LOW_COUNT_DEFAULT; // default to LED_LOW_COUNT_DEFAULT
-  }
-  if ( lua_isnumber(L, 2) )
-  {
-    high = lua_tointeger(L, 2);
-    if ( high < 0 ) {
-      return luaL_error( L, "wrong arg type" );
-    }
-  } else {
-    high = LED_HIGH_COUNT_DEFAULT; // default to LED_HIGH_COUNT_DEFAULT
-  }
-  led_high_count = (uint32_t)high / READLINE_INTERVAL;
-  led_low_count = (uint32_t)low / READLINE_INTERVAL;
-  prime_keyled_timer();
-  return 0;
-}
-
-// Lua: key(type, function)
-static int node_key( lua_State* L )
-{
-  int *ref = NULL;
-  size_t sl;
-
-  const char *str = luaL_checklstring( L, 1, &sl );
-  if (str == NULL)
-    return luaL_error( L, "wrong arg type" );
-
-  if (sl == 5 && c_strcmp(str, "short") == 0) {
-    ref = &short_key_ref;
-  } else if (sl == 4 && c_strcmp(str, "long") == 0) {
-    ref = &long_key_ref;
-  } else {
-    ref = &short_key_ref;
-  }
-  // luaL_checkanyfunction(L, 2);
-  if (lua_type(L, 2) == LUA_TFUNCTION || lua_type(L, 2) == LUA_TLIGHTFUNCTION) {
-    lua_pushvalue(L, 2);  // copy argument (func) to the top of stack
-    if (*ref != LUA_NOREF)
-      luaL_unref(L, LUA_REGISTRYINDEX, *ref);
-    *ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  } else {    // unref the key press function
-    if (*ref != LUA_NOREF)
-      luaL_unref(L, LUA_REGISTRYINDEX, *ref);
-    *ref = LUA_NOREF;
-  }
-
-  prime_keyled_timer();
-  return 0;
-}
-#endif
-
-extern lua_Load gLoad;
+extern int  lua_put_line(const char *s, size_t l);
 extern bool user_process_input(bool force);
+
 // Lua: input("string")
-static int node_input( lua_State* L )
-{
+static int node_input( lua_State* L ) {
   size_t l = 0;
   const char *s = luaL_checklstring(L, 1, &l);
-  if (s != NULL && l > 0 && l < LUA_MAXINPUT - 1)
-  {
-    lua_Load *load = &gLoad;
-    if (load->line_position == 0) {
-      c_memcpy(load->line, s, l);
-      load->line[l + 1] = '\0';
-      load->line_position = c_strlen(load->line) + 1;
-      load->done = 1;
-      NODE_DBG("Get command:\n");
-      NODE_DBG(load->line); // buggy here
-      NODE_DBG("\nResult(if any):\n");
-      user_process_input(true);
-    }
+  if (lua_put_line(s, l)) {
+    NODE_DBG("Result (if any):\n");
+    user_process_input(true);
   }
   return 0;
 }
@@ -328,12 +245,12 @@ static int output_redir_ref = LUA_NOREF;
 static int serial_debug = 1;
 void output_redirect(const char *str) {
   lua_State *L = lua_getstate();
-  // if(c_strlen(str)>=TX_BUFF_SIZE){
+  // if(strlen(str)>=TX_BUFF_SIZE){
   //   NODE_ERR("output too long.\n");
   //   return;
   // }
 
-  if (output_redir_ref == LUA_NOREF || !L) {
+  if (output_redir_ref == LUA_NOREF) {
     uart0_sendStr(str);
     return;
   }
@@ -380,11 +297,11 @@ static int writer(lua_State* L, const void* p, size_t size, void* u)
 {
   UNUSED(L);
   int file_fd = *( (int *)u );
-  if ((FS_OPEN_OK - 1) == file_fd)
+  if (!file_fd)
     return 1;
   NODE_DBG("get fd:%d,size:%d\n", file_fd, size);
 
-  if (size != 0 && (size != fs_write(file_fd, (const char *)p, size)) )
+  if (size != 0 && (size != vfs_write(file_fd, (const char *)p, size)) )
     return 1;
   NODE_DBG("write fd:%d,size:%d\n", file_fd, size);
   return 0;
@@ -395,23 +312,26 @@ static int writer(lua_State* L, const void* p, size_t size, void* u)
 static int node_compile( lua_State* L )
 {
   Proto* f;
-  int file_fd = FS_OPEN_OK - 1;
+  int file_fd = 0;
   size_t len;
   const char *fname = luaL_checklstring( L, 1, &len );
-  if ( len >= FS_NAME_MAX_LENGTH )
-    return luaL_error(L, "filename too long");
+  const char *basename = vfs_basename( fname );
+  luaL_argcheck(L, strlen(basename) <= FS_OBJ_NAME_LEN && strlen(fname) == len, 1, "filename invalid");
 
-  char output[FS_NAME_MAX_LENGTH];
-  c_strcpy(output, fname);
+  char *output = luaM_malloc( L, len+1 );
+  strcpy(output, fname);
   // check here that filename end with ".lua".
-  if (len < 4 || (c_strcmp( output + len - 4, ".lua") != 0) )
+  if (len < 4 || (strcmp( output + len - 4, ".lua") != 0) ) {
+    luaM_free( L, output );
     return luaL_error(L, "not a .lua file");
+  }
 
-  output[c_strlen(output) - 2] = 'c';
-  output[c_strlen(output) - 1] = '\0';
+  output[strlen(output) - 2] = 'c';
+  output[strlen(output) - 1] = '\0';
   NODE_DBG(output);
   NODE_DBG("\n");
   if (luaL_loadfsfile(L, fname) != 0) {
+    luaM_free( L, output );
     return luaL_error(L, lua_tostring(L, -1));
   }
 
@@ -419,9 +339,10 @@ static int node_compile( lua_State* L )
 
   int stripping = 1;      /* strip debug information? */
 
-  file_fd = fs_open(output, fs_mode2flag("w+"));
-  if (file_fd < FS_OPEN_OK)
+  file_fd = vfs_open(output, "w+");
+  if (!file_fd)
   {
+    luaM_free( L, output );
     return luaL_error(L, "cannot open/write to file");
   }
 
@@ -429,12 +350,13 @@ static int node_compile( lua_State* L )
   int result = luaU_dump(L, f, writer, &file_fd, stripping);
   lua_unlock(L);
 
-  if (fs_flush(file_fd) < 0) {   // result codes aren't propagated by flash_fs.h
+  if (vfs_flush(file_fd) != VFS_RES_OK) {
     // overwrite Lua error, like writer() does in case of a file io error
     result = 1;
   }
-  fs_close(file_fd);
-  file_fd = FS_OPEN_OK - 1;
+  vfs_close(file_fd);
+  file_fd = 0;
+  luaM_free( L, output );
 
   if (result == LUA_ERR_CC_INTOVERFLOW) {
     return luaL_error(L, "value too big or small for target integer type");
@@ -500,6 +422,13 @@ static int node_setcpufreq(lua_State* L)
   }
   new_freq = ets_get_cpu_frequency();
   lua_pushinteger(L, new_freq);
+  return 1;
+}
+
+// Lua: freq = node.getcpufreq()
+static int node_getcpufreq(lua_State* L)
+{
+  lua_pushinteger(L, system_get_cpu_freq());
   return 1;
 }
 
@@ -594,14 +523,23 @@ static int node_stripdebug (lua_State *L) {
 // See legc.h and lecg.c.
 static int node_egc_setmode(lua_State* L) {
   unsigned mode  = luaL_checkinteger(L, 1);
-  unsigned limit = luaL_optinteger (L, 2, 0);
+  int limit = luaL_optinteger (L, 2, 0);
 
   luaL_argcheck(L, mode <= (EGC_ON_ALLOC_FAILURE | EGC_ON_MEM_LIMIT | EGC_ALWAYS), 1, "invalid mode");
-  luaL_argcheck(L, !(mode & EGC_ON_MEM_LIMIT) || limit>0, 1, "limit must be non-zero");
+  luaL_argcheck(L, !(mode & EGC_ON_MEM_LIMIT) || limit!=0, 1, "limit must be non-zero");
 
   legc_set_mode( L, mode, limit );
   return 0;
 }
+
+// totalallocated, estimatedused = node.egc.meminfo()
+static int node_egc_meminfo(lua_State *L) {
+  global_State *g = G(L);
+  lua_pushinteger(L, g->totalbytes);
+  lua_pushinteger(L, g->estimate);
+  return 2;
+}
+
 //
 // Lua: osprint(true/false)
 // Allows you to turn on the native Espressif SDK printing
@@ -613,62 +551,316 @@ static int node_osprint( lua_State* L )
     system_set_os_print(0);
   }
 
-  return 0;  
+  return 0;
 }
+
+int node_random_range(int l, int u) {
+  // The range is the number of different values to return
+  unsigned int range = u + 1 - l;
+
+  // If this is very large then use simpler code
+  if (range >= 0x7fffffff) {
+    unsigned int v;
+
+    // This cannot loop more than half the time
+    while ((v = os_random()) >= range) {
+    }
+
+    // Now v is in the range [0, range)
+    return v + l;
+  }
+
+  // Easy case, with only one value, we know the result
+  if (range == 1) {
+    return l;
+  }
+
+  // Another easy case -- uniform 32-bit
+  if (range == 0) {
+    return os_random();
+  }
+
+  // Now we have to figure out what a large multiple of range is
+  // that just fits into 32 bits.
+  // The limit will be less than 1 << 32 by some amount (not much)
+  uint32_t limit = ((0x80000000 / ((range + 1) >> 1)) - 1) * range;
+
+  uint32_t v;
+
+  while ((v = os_random()) >= limit) {
+  }
+
+  // Now v is uniformly distributed in [0, limit) and limit is a multiple of range
+
+  return (v % range) + l;
+}
+
+static int node_random (lua_State *L) {
+  int u;
+  int l;
+
+  switch (lua_gettop(L)) {  /* check number of arguments */
+    case 0: {  /* no arguments */
+#ifdef LUA_NUMBER_INTEGRAL
+      lua_pushnumber(L, 0);  /* Number between 0 and 1 - always 0 with ints */
+#else
+      lua_pushnumber(L, (lua_Number)os_random() / (lua_Number)(1LL << 32));
+#endif
+      return 1;
+    }
+    case 1: {  /* only upper limit */
+      l = 1;
+      u = luaL_checkint(L, 1);
+      break;
+    }
+    case 2: {  /* lower and upper limits */
+      l = luaL_checkint(L, 1);
+      u = luaL_checkint(L, 2);
+      break;
+    }
+    default:
+      return luaL_error(L, "wrong number of arguments");
+  }
+  luaL_argcheck(L, l<=u, 2, "interval is empty");
+  lua_pushnumber(L, node_random_range(l, u));  /* int between `l' and `u' */
+  return 1;
+}
+
+#ifdef DEVELOPMENT_TOOLS
+// Lua: rec = node.readrcr(id)
+static int node_readrcr (lua_State *L) {
+  int id  = luaL_checkinteger(L, 1);
+  char *data;
+  int n = platform_rcr_read(id, (void **)&data);
+  if (n == ~0) return 0;
+  lua_pushlstring(L, data, n);
+  return 1;
+}
+// Lua: n = node.writercr(id,rec)
+static int node_writercr (lua_State *L) {
+  int id = luaL_checkinteger(L, 1),l;
+  const char *data = lua_tolstring(L, 2, &l);
+  int n = platform_rcr_write(id, data, l);
+  lua_pushinteger(L, n);
+  return 1;
+}
+#endif
+
+typedef enum pt_t { lfs_addr=0, lfs_size, spiffs_addr, spiffs_size, max_pt} pt_t;
+
+LROT_BEGIN(pt)
+  LROT_NUMENTRY( lfs_addr, lfs_addr )
+  LROT_NUMENTRY( lfs_size, lfs_size )
+  LROT_NUMENTRY( spiffs_addr, spiffs_addr )
+  LROT_NUMENTRY( spiffs_size, spiffs_size )
+LROT_END( pt, NULL, 0 )
+
+
+// Lua: ptinfo = node.getpartitiontable()
+static int node_getpartitiontable (lua_State *L) {
+  uint32_t param[max_pt] = {0};
+  param[lfs_size]    = platform_flash_get_partition(NODEMCU_LFS0_PARTITION, param + lfs_addr);
+  param[spiffs_size] = platform_flash_get_partition(NODEMCU_SPIFFS0_PARTITION, param + spiffs_addr);
+
+  lua_settop(L, 0);
+  lua_createtable (L, 0, max_pt);                   /* at index 1 */
+  lua_pushrotable(L, (void*)pt_map);                /* at index 2 */
+  lua_pushnil(L);                                   /* first key at index 3 */
+  while (lua_next(L, 2) != 0) {                     /* key at index 3, and v at index 4 */
+    lua_pushvalue(L, 3);                            /* dup key to index 5 */
+    lua_pushinteger(L, param[lua_tointeger(L, 4)]); /* param [v] at index 6 */
+    lua_rawset(L, 1);
+    lua_pop(L, 1);                                  /* discard v */
+  }
+  lua_pop(L, 1);                                    /* discard pt_map reference */
+  return 1;
+}
+
+static void insert_partition(partition_item_t *p, int n, uint32_t type, uint32_t addr) {
+  if (n>0)
+    memmove(p+1, p, n*sizeof(partition_item_t)); /* overlapped so must be move not cpy */
+  p->type = type;
+  p->addr = addr;
+  p->size = 0;
+}
+
+static void delete_partition(partition_item_t *p, int n) {
+  if (n>0)
+    memmove(p, p+1, n*sizeof(partition_item_t)); /* overlapped so must be move not cpy */
+}
+
+#define SKIP (~0)
+#define IROM0_PARTITION  (SYSTEM_PARTITION_CUSTOMER_BEGIN + NODEMCU_IROM0TEXT_PARTITION)
+#define LFS_PARTITION    (SYSTEM_PARTITION_CUSTOMER_BEGIN + NODEMCU_LFS0_PARTITION)
+#define SPIFFS_PARTITION (SYSTEM_PARTITION_CUSTOMER_BEGIN + NODEMCU_SPIFFS0_PARTITION)
+
+// Lua: node.setpartitiontable(pt_settings)
+static int node_setpartitiontable (lua_State *L) {
+  partition_item_t *rcr_pt = NULL, *pt;
+  uint32_t flash_size = flash_rom_get_size_byte();
+  uint32_t i = platform_rcr_read(PLATFORM_RCR_PT, (void **) &rcr_pt);
+  uint32_t last = 0;
+  uint32_t n = i / sizeof(partition_item_t);
+  uint32_t param[max_pt] = {SKIP, SKIP, SKIP, SKIP};
+
+  luaL_argcheck(L, lua_istable(L, 1), 1, "must be table");
+  lua_settop(L, 1);
+  /* convert input table into 4 option array */
+  lua_pushrotable(L, (void*)pt_map);  /* at index 2 */
+  lua_pushnil(L);                   /* first key at index 3 */
+  while (lua_next(L, 1) != 0) {
+    /* 'key' (at index 3) and 'value' (at index 4) */
+    luaL_argcheck(L, lua_isstring(L, 3) && lua_isnumber(L, 4), 1, "invalid partition setting");
+    lua_pushvalue(L, 3);  /* dup key to index 5 */
+    lua_rawget(L, 2);     /* lookup in pt_map */
+    luaL_argcheck(L, !lua_isnil(L, -1), 1, "invalid partition setting");
+    param[lua_tointeger(L, 5)] = lua_tointeger(L, 4);
+    /* removes 'value'; keeps 'key' for next iteration */
+    lua_pop(L, 2);  /* discard value and lookup */
+  }
+ /*
+  * Allocate a scratch Partition Table as userdata on the Lua stack, and copy the
+  * current Flash PT into this for manipulation
+  */
+  lua_newuserdata(L, (n+2)*sizeof(partition_item_t));
+  pt = lua_touserdata (L, -1);
+  memcpy(pt, rcr_pt, n*sizeof(partition_item_t));
+  pt[n].type = 0; pt[n+1].type = 0;
+
+  for (i = 0; i < n; i ++) {
+    partition_item_t *p = pt + i;
+
+    if (p->type == IROM0_PARTITION && p[1].type != LFS_PARTITION) {
+      // if the LFS partition is not following IROM0 then slot a blank one in
+      insert_partition(p + 1, n-i-1, LFS_PARTITION, p->addr + p->size);
+      n++;
+
+    } else if (p->type == LFS_PARTITION) {
+      if (p[1].type != SPIFFS_PARTITION) {
+        // if the SPIFFS partition is not following LFS then slot a blank one in
+        insert_partition(p + 1, n-i-1, SPIFFS_PARTITION, 0);
+        n++;
+      }
+      // update the LFS options if set
+      if (param[lfs_addr] != SKIP) {
+        p->addr = param[lfs_addr];
+      }
+      if (param[lfs_size] != SKIP) {
+        p->size = param[lfs_size];
+      }
+    } else if (p->type == SPIFFS_PARTITION) {
+      // update the SPIFFS options if set
+      if (param[spiffs_addr] != SKIP) {
+        p->addr = param[spiffs_addr];
+        p->size = SKIP;
+      }
+      if (param[spiffs_size] != SKIP) {
+        // BOTCH: - at the moment the firmware doesn't boot if the SPIFFS partition
+        //          is deleted so the minimum SPIFFS size is 64Kb
+        p->size = param[spiffs_size] > 0x10000 ? param[spiffs_size] : 0x10000;
+      }
+      if (p->size == SKIP) {
+        if (p->addr < 0) {
+          // This allocate all the remaining flash to SPIFFS
+          p->addr = last;
+          p->size = flash_size - last;
+        } else {
+          p->size = flash_size - p->addr;
+        }
+      } else if (/* size is specified && */ p->addr == 0) {
+        // if the is addr not specified then start SPIFFS at 1Mb
+        // boundary if the size will fit otherwise make it consecutive
+        // to the previous partition.
+        p->addr = (p->size <= flash_size - 0x100000) ? 0x100000 : last;
+      }
+    }
+
+    if (p->size == 0) {
+      // Delete 0-sized partitions as the SDK barfs on these
+      delete_partition(p, n-i-1);
+      n--; i--;
+    } else {
+      // Do consistency tests on the partition
+      if (p->addr & (INTERNAL_FLASH_SECTOR_SIZE - 1) ||
+        p->size & (INTERNAL_FLASH_SECTOR_SIZE - 1) ||
+        p->addr < last ||
+        p->addr + p->size > flash_size) {
+        luaL_error(L, "value out of range");
+      }
+    }
+  }
+//  for (i = 0; i < n; i ++)
+//    dbg_printf("Partition %d: %04x %06x %06x\n", i, pt[i].type, pt[i].addr, pt[i].size);
+    platform_rcr_write(PLATFORM_RCR_PT, pt, n*sizeof(partition_item_t));
+    while(1); // Trigger WDT; the new PT will be loaded on reboot
+
+  return 0;
+}
+
 
 // Module function map
 
-static const LUA_REG_TYPE node_egc_map[] = {
-  { LSTRKEY( "setmode" ),           LFUNCVAL( node_egc_setmode ) },
-  { LSTRKEY( "NOT_ACTIVE" ),        LNUMVAL( EGC_NOT_ACTIVE ) },
-  { LSTRKEY( "ON_ALLOC_FAILURE" ),  LNUMVAL( EGC_ON_ALLOC_FAILURE ) },
-  { LSTRKEY( "ON_MEM_LIMIT" ),      LNUMVAL( EGC_ON_MEM_LIMIT ) },
-  { LSTRKEY( "ALWAYS" ),            LNUMVAL( EGC_ALWAYS ) },
-  { LNILKEY, LNILVAL }
-};
-static const LUA_REG_TYPE node_task_map[] = {
-  { LSTRKEY( "post" ),            LFUNCVAL( node_task_post ) },
-  { LSTRKEY( "LOW_PRIORITY" ),    LNUMVAL( TASK_PRIORITY_LOW ) },
-  { LSTRKEY( "MEDIUM_PRIORITY" ), LNUMVAL( TASK_PRIORITY_MEDIUM ) },
-  { LSTRKEY( "HIGH_PRIORITY" ),   LNUMVAL( TASK_PRIORITY_HIGH ) },
-  { LNILKEY, LNILVAL }
-};
+LROT_BEGIN(node_egc)
+  LROT_FUNCENTRY( meminfo, node_egc_meminfo )
+  LROT_FUNCENTRY( setmode, node_egc_setmode )
+  LROT_NUMENTRY( NOT_ACTIVE, EGC_NOT_ACTIVE )
+  LROT_NUMENTRY( ON_ALLOC_FAILURE, EGC_ON_ALLOC_FAILURE )
+  LROT_NUMENTRY( ON_MEM_LIMIT, EGC_ON_MEM_LIMIT )
+  LROT_NUMENTRY( ALWAYS, EGC_ALWAYS )
+LROT_END( node_egc, NULL, 0 )
 
-static const LUA_REG_TYPE node_map[] =
-{
-  { LSTRKEY( "restart" ), LFUNCVAL( node_restart ) },
-  { LSTRKEY( "dsleep" ), LFUNCVAL( node_deepsleep ) },
-  { LSTRKEY( "info" ), LFUNCVAL( node_info ) },
-  { LSTRKEY( "chipid" ), LFUNCVAL( node_chipid ) },
-  { LSTRKEY( "flashid" ), LFUNCVAL( node_flashid ) },
-  { LSTRKEY( "flashsize" ), LFUNCVAL( node_flashsize) },
-  { LSTRKEY( "heap" ), LFUNCVAL( node_heap ) },
-#ifdef DEVKIT_VERSION_0_9
-  { LSTRKEY( "key" ), LFUNCVAL( node_key ) },
-  { LSTRKEY( "led" ), LFUNCVAL( node_led ) },
+LROT_BEGIN(node_task)
+  LROT_FUNCENTRY( post, node_task_post )
+  LROT_NUMENTRY( LOW_PRIORITY, TASK_PRIORITY_LOW )
+  LROT_NUMENTRY( MEDIUM_PRIORITY, TASK_PRIORITY_MEDIUM )
+  LROT_NUMENTRY( HIGH_PRIORITY, TASK_PRIORITY_HIGH )
+LROT_END( node_task, NULL, 0 )
+
+LROT_BEGIN(node)
+  LROT_FUNCENTRY( heap, node_heap )
+  LROT_FUNCENTRY( info, node_info )
+  LROT_TABENTRY( task, node_task )
+  LROT_FUNCENTRY( flashreload, luaN_reload_reboot )
+  LROT_FUNCENTRY( flashindex, luaN_index )
+  LROT_FUNCENTRY( restart, node_restart )
+  LROT_FUNCENTRY( dsleep, node_deepsleep )
+  LROT_FUNCENTRY( dsleepMax, dsleepMax )
+  LROT_FUNCENTRY( sleep, node_sleep )
+#ifdef PMSLEEP_ENABLE
+  PMSLEEP_INT_MAP
 #endif
-  { LSTRKEY( "input" ), LFUNCVAL( node_input ) },
-  { LSTRKEY( "output" ), LFUNCVAL( node_output ) },
-// Moved to adc module, use adc.readvdd33()
-// { LSTRKEY( "readvdd33" ), LFUNCVAL( node_readvdd33) },
-  { LSTRKEY( "compile" ), LFUNCVAL( node_compile) },
-  { LSTRKEY( "CPU80MHZ" ), LNUMVAL( CPU80MHZ ) },
-  { LSTRKEY( "CPU160MHZ" ), LNUMVAL( CPU160MHZ ) },
-  { LSTRKEY( "setcpufreq" ), LFUNCVAL( node_setcpufreq) },
-  { LSTRKEY( "bootreason" ), LFUNCVAL( node_bootreason) },
-  { LSTRKEY( "restore" ), LFUNCVAL( node_restore) },
-#ifdef LUA_OPTIMIZE_DEBUG
-  { LSTRKEY( "stripdebug" ), LFUNCVAL( node_stripdebug ) },
-#endif
-  { LSTRKEY( "egc" ),  LROVAL( node_egc_map ) },
-  { LSTRKEY( "task" ), LROVAL( node_task_map ) },
 #ifdef DEVELOPMENT_TOOLS
-  { LSTRKEY( "osprint" ), LFUNCVAL( node_osprint ) },
+  LROT_FUNCENTRY( readrcr, node_readrcr )
+  LROT_FUNCENTRY( writercr, node_writercr )
 #endif
+  LROT_FUNCENTRY( chipid, node_chipid )
+  LROT_FUNCENTRY( flashid, node_flashid )
+  LROT_FUNCENTRY( flashsize, node_flashsize )
+  LROT_FUNCENTRY( input, node_input )
+  LROT_FUNCENTRY( output, node_output )
+// Moved to adc module, use adc.readvdd33()
+//  LROT_FUNCENTRY( readvdd33, node_readvdd33 )
+  LROT_FUNCENTRY( compile, node_compile )
+  LROT_NUMENTRY( CPU80MHZ, CPU80MHZ )
+  LROT_NUMENTRY( CPU160MHZ, CPU160MHZ )
+  LROT_FUNCENTRY( setcpufreq, node_setcpufreq )
+  LROT_FUNCENTRY( getcpufreq, node_getcpufreq )
+  LROT_FUNCENTRY( bootreason, node_bootreason )
+  LROT_FUNCENTRY( restore, node_restore )
+  LROT_FUNCENTRY( random, node_random )
+#ifdef LUA_OPTIMIZE_DEBUG
+  LROT_FUNCENTRY( stripdebug, node_stripdebug )
+#endif
+  LROT_TABENTRY( egc, node_egc )
+#ifdef DEVELOPMENT_TOOLS
+  LROT_FUNCENTRY( osprint, node_osprint )
+#endif
+  LROT_FUNCENTRY( getpartitiontable, node_getpartitiontable )
+  LROT_FUNCENTRY( setpartitiontable, node_setpartitiontable )
 
 // Combined to dsleep(us, option)
-// { LSTRKEY( "dsleepsetoption" ), LFUNCVAL( node_deepsleep_setoption) },
-  { LNILKEY, LNILVAL }
-};
+//  LROT_FUNCENTRY( dsleepsetoption, node_deepsleep_setoption )
+LROT_END( node, NULL, 0 )
 
-NODEMCU_MODULE(NODE, "node", node_map, NULL);
+
+NODEMCU_MODULE(NODE, "node", node, NULL);
